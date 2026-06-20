@@ -41,7 +41,7 @@ func TestThemeRendersVisibleFrameAndContentAccents(t *testing.T) {
 	m.setViewportContent()
 
 	rendered := m.View()
-	for _, want := range []string{"agent-stats", "SUMMARY", "Total:", "Group", "┃"} {
+	for _, want := range []string{"agent-stats", "SUMMARY", "Weekly credits:", "Week", "┃"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected themed view to contain %q, got:\n%s", want, rendered)
 		}

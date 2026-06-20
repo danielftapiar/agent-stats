@@ -57,6 +57,8 @@ agent-stats graph
 agent-stats graph --since 7d
 agent-stats sessions --limit 20
 agent-stats commands --limit 20
+agent-stats payload
+agent-stats payload <session-id>
 agent-stats export --format json
 ```
 
@@ -66,14 +68,14 @@ The CLI should support a small set of useful views over the same parsed token da
 
 Useful views:
 
-- `summary`: totals over the selected time range, grouped by token type.
+- `summary`: weekly credit spend, cache hit rate, and function-call totals.
 - `today`: current-day totals, grouped by token type and session.
 - `daily`: usage grouped by day, with stacked token types.
-- `sessions`: usage grouped by Codex session, sorted by total tokens.
-- `hourly`: usage grouped by hour of day to show active working periods.
+- `sessions`: usage grouped by Codex session, sorted by latest activity, with model and credits.
 - `cache`: cache hit rate grouped by day or session.
 - `reasoning`: reasoning output tokens grouped by day or session.
 - `commands`: function calls grouped by command name, with call count, session count, directory count, and first/last seen timestamps.
+- `payload`: payload events grouped by top-level type, payload type, and phase. When opened for a session, it shows session timing rollups and token usage per interaction.
 - `tokens`: input, cached input, output, and reasoning output grouped together for direct comparison.
 - `top`: highest-usage sessions grouped by total tokens.
 
@@ -81,14 +83,15 @@ Useful group-by combinations:
 
 | View | Primary group | Secondary group | Useful for |
 | --- | --- | --- | --- |
-| `summary` | time range | token type | Understanding total usage at a glance |
+| `summary` | `YEAR-W##` | credits/cache/function calls | Understanding weekly spend and cache efficiency |
 | `daily` | day | token type | Spotting heavy usage days |
 | `sessions` | session | token type | Finding expensive sessions |
-| `hourly` | hour | token type | Seeing when usage happens |
 | `cache --group day` | day | cache hit/miss | Tracking cache efficiency over time |
 | `cache --group session` | session | cache hit/miss | Finding sessions with poor cache reuse |
 | `reasoning --group day` | day | reasoning output | Tracking reasoning-heavy usage |
 | `commands` | command name | function call metadata | Finding the tools and shell commands used most often |
+| `payload` | top-level type/payload type/phase | payload size and timing | Inspecting local Codex event shapes for later analysis |
+| `payload <session-id>` | interaction timestamp | token usage and payload timing | Drilling into one session's interaction-level cost |
 | `top --by total` | session | total tokens | Ranking the biggest sessions |
 | `top --by cached` | session | cached input tokens | Seeing where cache reuse is high |
 | `top --by output` | session | output tokens | Finding output-heavy sessions |
@@ -113,10 +116,10 @@ Interactive mode should support colon commands for switching views:
 :today
 :daily
 :sessions
-:hourly
 :cache
 :reasoning
 :commands
+:payload
 :tokens
 :top
 :help
@@ -126,7 +129,7 @@ Interactive mode should support colon commands for switching views:
 The same views should also be available as numbered tabs across the top of the UI:
 
 ```text
-1 Summary  2 Today  3 Daily  4 Sessions  5 Hourly  6 Cache  7 Reasoning  8 Commands  9 Tokens  10 Top
+1 Summary  2 Today  3 Daily  4 Sessions  5 Hourly  6 Cache  7 Reasoning  8 Commands  9 Payload  10 Tokens  11 Top
 ```
 
 Keyboard behavior:
@@ -135,6 +138,7 @@ Keyboard behavior:
 - Type a view command such as `:daily` and press `Enter` to switch views.
 - Press `1` through `9` to switch directly to the first nine tabs.
 - Press `Tab` and `Shift+Tab` to move to the next or previous view, including tabs beyond `9`.
+- In `sessions`, use `j`/`k` to select a session and `Enter` to open its `payload` drilldown.
 - Press `?` to show available commands.
 - Press `q` or run `:quit` to exit.
 
@@ -217,7 +221,14 @@ Example `.githooks/pre-commit`:
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "Formatting Go files..."
 go fmt ./...
+
+if ! git diff --quiet; then
+  echo "go fmt changed files. Review and stage the formatting changes, then commit again."
+  exit 1
+fi
+
 go test ./...
 ```
 
@@ -308,6 +319,7 @@ CREATE TABLE token_events (
   reasoning_output_tokens INTEGER NOT NULL,
   total_tokens INTEGER NOT NULL,
   model_context_window INTEGER
+  model TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE command_events (
@@ -320,19 +332,55 @@ CREATE TABLE command_events (
   session_dir TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE payload_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  timestamp TEXT NOT NULL,
+  top_level_type TEXT NOT NULL,
+  payload_type TEXT NOT NULL,
+  phase TEXT NOT NULL DEFAULT '',
+  payload_bytes INTEGER NOT NULL,
+  completed_at TEXT NOT NULL DEFAULT '',
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  time_to_first_token_ms INTEGER NOT NULL DEFAULT 0,
+  command_name TEXT NOT NULL DEFAULT '',
+  normalized_command TEXT NOT NULL DEFAULT '',
+  call_id TEXT NOT NULL DEFAULT '',
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  model_context_window INTEGER NOT NULL DEFAULT 0,
+  model TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '',
+  raw_json TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE model_credit_rates (
+  model TEXT PRIMARY KEY,
+  input_credits_per_million REAL NOT NULL,
+  cached_input_credits_per_million REAL NOT NULL,
+  output_credits_per_million REAL NOT NULL,
+  reasoning_credits_per_million REAL NOT NULL
+);
+
 CREATE INDEX token_events_timestamp_idx ON token_events(timestamp);
 CREATE INDEX token_events_session_idx ON token_events(session_id);
 CREATE INDEX command_events_command_name_idx ON command_events(command_name);
+CREATE INDEX payload_events_type_idx ON payload_events(top_level_type, payload_type, phase);
 ```
 
 The `token_events` table should store per-event increments, not cumulative totals. That keeps every view simple:
 
-- `summary`: sum columns over the selected time range.
+- `summary`: group token and command totals by `YEAR-W##`, such as `2026-W01`.
 - `daily`: group by `date(timestamp)`.
-- `hourly`: group by hour.
 - `sessions`: group by `session_id`.
 - `cache`: calculate from summed `cached_input_tokens` and `input_tokens`.
 - `commands`: group `command_events` by `command_name`.
+- `payload`: group `payload_events` by event shape, or by token-count interaction within one session.
+- `credits`: join token rows to `model_credit_rates` by model and apply the per-million-token relationship.
 
 Startup algorithm:
 
@@ -344,7 +392,9 @@ Startup algorithm:
 6. If changed and larger, seek to `processed_offset` and parse only appended lines.
 7. If changed and smaller, delete that file's cached events and reprocess from `0`.
 8. Store `response_item` function calls in `command_events` with command name, timestamp, session, and session directory.
-9. Update `source_files` in the same transaction as inserted events.
+9. Store every JSONL payload in `payload_events`, including raw payload JSON, payload length, timing fields, token usage for `token_count`, model, and normalized shell command names.
+10. Seed `model_credit_rates` for known Codex models. The table is local and editable if Codex changes credit accounting.
+11. Update `source_files` in the same transaction as inserted events.
 
 Interactive streaming algorithm:
 

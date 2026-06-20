@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sort"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,24 +21,37 @@ type Totals struct {
 	OutputTokens             int64   `json:"output_tokens"`
 	ReasoningOutputTokens    int64   `json:"reasoning_output_tokens"`
 	TotalTokens              int64   `json:"total_tokens"`
+	Credits                  float64 `json:"credits"`
 	CacheHitRate             float64 `json:"cache_hit_rate"`
 }
 
 type Row struct {
 	Label         string `json:"label"`
 	Directory     string `json:"directory,omitempty"`
+	Model         string `json:"model,omitempty"`
 	EventType     string `json:"event_type,omitempty"`
+	Phase         string `json:"phase,omitempty"`
 	FunctionCalls int64  `json:"function_calls,omitempty"`
 	SessionCount  int64  `json:"session_count,omitempty"`
+	Count         int64  `json:"count,omitempty"`
+	PayloadBytes  int64  `json:"payload_bytes,omitempty"`
+	AvgBytes      int64  `json:"avg_bytes,omitempty"`
+	MaxBytes      int64  `json:"max_bytes,omitempty"`
+	AvgDurationMS int64  `json:"avg_duration_ms,omitempty"`
+	MaxDurationMS int64  `json:"max_duration_ms,omitempty"`
+	AvgTTFTMS     int64  `json:"avg_time_to_first_token_ms,omitempty"`
 	FirstSeen     string `json:"first_seen,omitempty"`
 	LastSeen      string `json:"last_seen,omitempty"`
 	Totals        Totals `json:"totals"`
 }
 
 type Data struct {
-	View   string `json:"view"`
-	Totals Totals `json:"totals"`
-	Rows   []Row  `json:"rows"`
+	View          string `json:"view"`
+	Session       string `json:"session,omitempty"`
+	SelectedIndex int    `json:"selected_index,omitempty"`
+	Summary       []Row  `json:"summary,omitempty"`
+	Totals        Totals `json:"totals"`
+	Rows          []Row  `json:"rows"`
 }
 
 func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Time) (Data, error) {
@@ -47,14 +60,16 @@ func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Ti
 		err  error
 	)
 	switch view {
-	case "summary", "tokens":
+	case "summary":
+		rows, err = queryWeeklySummary(ctx, db)
+	case "tokens":
 		rows, err = queryGrouped(ctx, db, "token_type", "", 0)
 		if err == nil {
 			totals, totalsErr := queryTotals(ctx, db, "")
 			if totalsErr != nil {
 				return Data{}, totalsErr
 			}
-			return Data{View: view, Totals: totals, Rows: rows}, nil
+			return Data{View: view, SelectedIndex: -1, Totals: totals, Rows: rows}, nil
 		}
 	case "today":
 		start := now.Format("2006-01-02")
@@ -63,8 +78,6 @@ func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Ti
 		rows, err = queryGrouped(ctx, db, "substr(timestamp, 1, 10)", "", 0)
 	case "sessions":
 		rows, err = queryGrouped(ctx, db, "session_id", "", limitOrDefault(limit))
-	case "hourly":
-		rows, err = queryGrouped(ctx, db, "substr(timestamp, 12, 2) || ':00'", "", 0)
 	case "cache":
 		rows, err = queryGrouped(ctx, db, "substr(timestamp, 1, 10)", "", 0)
 	case "reasoning":
@@ -73,18 +86,210 @@ func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Ti
 		rows, err = queryGrouped(ctx, db, "session_id", "", limitOrDefault(limit))
 	case "commands":
 		rows, err = queryCommands(ctx, db, limitOrDefault(limit))
+	case "payload":
+		rows, err = queryPayloadSummary(ctx, db, limitOrDefault(limit))
 	default:
 		rows, err = queryGrouped(ctx, db, "substr(timestamp, 1, 10)", "", 0)
 	}
 	if err != nil {
 		return Data{}, err
 	}
-	data := Data{View: view, Rows: rows}
+	data := Data{View: view, SelectedIndex: -1, Rows: rows}
 	for _, row := range rows {
 		data.Totals = addTotals(data.Totals, row.Totals)
 	}
 	data.Totals.CacheHitRate = cacheHitRate(data.Totals)
 	return data, nil
+}
+
+func LoadSessionPayload(ctx context.Context, db *store.DB, sessionID string, limit int) (Data, error) {
+	rows, err := querySessionInteractions(ctx, db, sessionID, limitOrDefault(limit))
+	if err != nil {
+		return Data{}, err
+	}
+	summary, err := querySessionPayloadSummary(ctx, db, sessionID)
+	if err != nil {
+		return Data{}, err
+	}
+	data := Data{View: "payload", Session: sessionID, SelectedIndex: -1, Summary: summary, Rows: rows}
+	for _, row := range rows {
+		data.Totals = addTotals(data.Totals, row.Totals)
+	}
+	data.Totals.CacheHitRate = cacheHitRate(data.Totals)
+	return data, nil
+}
+
+const creditExpr = `(token_events.input_tokens * COALESCE(rate.input_credits_per_million, fallback.input_credits_per_million) +
+	token_events.cached_input_tokens * COALESCE(rate.cached_input_credits_per_million, fallback.cached_input_credits_per_million) +
+	token_events.output_tokens * COALESCE(rate.output_credits_per_million, fallback.output_credits_per_million) +
+	token_events.reasoning_output_tokens * COALESCE(rate.reasoning_credits_per_million, fallback.reasoning_credits_per_million)) / 1000000.0`
+
+const creditJoins = ` LEFT JOIN model_credit_rates rate ON rate.model = COALESCE(NULLIF(token_events.model, ''), 'unknown')
+	LEFT JOIN model_credit_rates fallback ON fallback.model = 'unknown'`
+
+func queryWeeklySummary(ctx context.Context, db *store.DB) ([]Row, error) {
+	query := `WITH weekly_tokens AS (
+		SELECT strftime('%Y-W%W', timestamp) AS label,
+			SUM(input_tokens) AS input_tokens,
+			SUM(cached_input_tokens) AS cached_input_tokens,
+			SUM(output_tokens) AS output_tokens,
+			SUM(reasoning_output_tokens) AS reasoning_output_tokens,
+			SUM(total_tokens) AS total_tokens,
+			SUM(` + creditExpr + `) AS credits,
+			MAX(timestamp) AS last_seen
+		FROM token_events` + creditJoins + `
+		GROUP BY label
+	),
+	weekly_calls AS (
+		SELECT strftime('%Y-W%W', timestamp) AS label, COUNT(*) AS function_calls
+		FROM command_events
+		GROUP BY label
+	)
+	SELECT weekly_tokens.label,
+		weekly_tokens.input_tokens,
+		weekly_tokens.cached_input_tokens,
+		weekly_tokens.output_tokens,
+		weekly_tokens.reasoning_output_tokens,
+		weekly_tokens.total_tokens,
+		weekly_tokens.credits,
+		COALESCE(weekly_calls.function_calls, 0),
+		weekly_tokens.last_seen
+	FROM weekly_tokens
+	LEFT JOIN weekly_calls ON weekly_calls.label = weekly_tokens.label
+	ORDER BY weekly_tokens.label DESC`
+	sqlRows, err := db.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+	var rows []Row
+	for sqlRows.Next() {
+		var row Row
+		if err := sqlRows.Scan(
+			&row.Label,
+			&row.Totals.InputTokens,
+			&row.Totals.CachedInputTokens,
+			&row.Totals.OutputTokens,
+			&row.Totals.ReasoningOutputTokens,
+			&row.Totals.TotalTokens,
+			&row.Totals.Credits,
+			&row.FunctionCalls,
+			&row.LastSeen,
+		); err != nil {
+			return nil, err
+		}
+		row.Totals = withDerived(row.Totals)
+		rows = append(rows, row)
+	}
+	return rows, sqlRows.Err()
+}
+
+func queryPayloadSummary(ctx context.Context, db *store.DB, limit int) ([]Row, error) {
+	query := `SELECT top_level_type || '/' || payload_type AS label,
+		phase,
+		COUNT(*),
+		SUM(payload_bytes),
+		CAST(AVG(payload_bytes) AS INTEGER),
+		MAX(payload_bytes),
+		CAST(AVG(duration_ms) AS INTEGER),
+		MAX(duration_ms),
+		CAST(AVG(time_to_first_token_ms) AS INTEGER),
+		MIN(timestamp),
+		MAX(timestamp)
+		FROM payload_events
+		GROUP BY top_level_type, payload_type, phase
+		ORDER BY MAX(timestamp) DESC`
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	sqlRows, err := db.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+	var rows []Row
+	for sqlRows.Next() {
+		var row Row
+		if err := sqlRows.Scan(&row.Label, &row.Phase, &row.Count, &row.PayloadBytes, &row.AvgBytes, &row.MaxBytes, &row.AvgDurationMS, &row.MaxDurationMS, &row.AvgTTFTMS, &row.FirstSeen, &row.LastSeen); err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	return rows, sqlRows.Err()
+}
+
+func querySessionPayloadSummary(ctx context.Context, db *store.DB, sessionID string) ([]Row, error) {
+	rows := []Row{}
+	if row, err := singlePayloadMetric(ctx, db, sessionID, "duration", `SELECT 'session duration', '', 1, 0, 0, 0, 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ?`); err != nil {
+		return nil, err
+	} else {
+		row.AvgDurationMS = diffMillis(row.FirstSeen, row.LastSeen)
+		rows = append(rows, row)
+	}
+	if row, err := singlePayloadMetric(ctx, db, sessionID, "prompt-final", `SELECT 'prompt to final answer', '', 1, 0, 0, 0, 0, 0, 0, COALESCE(MIN(CASE WHEN top_level_type = 'event_msg' THEN timestamp END), ''), COALESCE(MAX(CASE WHEN top_level_type = 'response_item' AND payload_type = 'message' THEN timestamp END), '') FROM payload_events WHERE session_id = ?`); err != nil {
+		return nil, err
+	} else {
+		row.AvgDurationMS = diffMillis(row.FirstSeen, row.LastSeen)
+		rows = append(rows, row)
+	}
+	if row, err := singlePayloadMetric(ctx, db, sessionID, "response_item timing", `SELECT 'response_item timing', '', COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0), COALESCE(MAX(payload_bytes), 0), COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0), COALESCE(MAX(duration_ms), 0), COALESCE(CAST(AVG(time_to_first_token_ms) AS INTEGER), 0), COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? AND top_level_type = 'response_item'`); err != nil {
+		return nil, err
+	} else {
+		rows = append(rows, row)
+	}
+	if row, err := singlePayloadMetric(ctx, db, sessionID, "payload by phase", `SELECT 'payload bytes by phase', phase, COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0), COALESCE(MAX(payload_bytes), 0), 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? GROUP BY phase ORDER BY SUM(payload_bytes) DESC LIMIT 1`); err != nil {
+		return nil, err
+	} else {
+		rows = append(rows, row)
+	}
+	if row, err := singlePayloadMetric(ctx, db, sessionID, "most used command", `SELECT 'most used command', COALESCE(NULLIF(normalized_command, ''), command_name), COUNT(*), 0, 0, 0, 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? AND payload_type = 'function_call' GROUP BY COALESCE(NULLIF(normalized_command, ''), command_name) ORDER BY COUNT(*) DESC LIMIT 1`); err != nil {
+		return nil, err
+	} else if row.Label != "" {
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+func singlePayloadMetric(ctx context.Context, db *store.DB, sessionID, label, query string) (Row, error) {
+	sqlRows, err := db.Query(ctx, query, sessionID)
+	if err != nil {
+		return Row{}, err
+	}
+	defer sqlRows.Close()
+	row := Row{Label: label}
+	if sqlRows.Next() {
+		if err := sqlRows.Scan(&row.Label, &row.Phase, &row.Count, &row.PayloadBytes, &row.AvgBytes, &row.MaxBytes, &row.AvgDurationMS, &row.MaxDurationMS, &row.AvgTTFTMS, &row.FirstSeen, &row.LastSeen); err != nil {
+			return Row{}, err
+		}
+	}
+	return row, sqlRows.Err()
+}
+
+func querySessionInteractions(ctx context.Context, db *store.DB, sessionID string, limit int) ([]Row, error) {
+	query := `SELECT timestamp,
+		input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+		payload_bytes, duration_ms, time_to_first_token_ms
+		FROM payload_events
+		WHERE session_id = ? AND payload_type = 'token_count'
+		ORDER BY timestamp DESC`
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	sqlRows, err := db.Query(ctx, query, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+	var rows []Row
+	for sqlRows.Next() {
+		var row Row
+		if err := sqlRows.Scan(&row.Label, &row.Totals.InputTokens, &row.Totals.CachedInputTokens, &row.Totals.OutputTokens, &row.Totals.ReasoningOutputTokens, &row.Totals.TotalTokens, &row.PayloadBytes, &row.AvgDurationMS, &row.AvgTTFTMS); err != nil {
+			return nil, err
+		}
+		row.Totals = withDerived(row.Totals)
+		rows = append(rows, row)
+	}
+	return rows, sqlRows.Err()
 }
 
 func queryCommands(ctx context.Context, db *store.DB, limit int) ([]Row, error) {
@@ -97,7 +302,7 @@ func queryCommands(ctx context.Context, db *store.DB, limit int) ([]Row, error) 
 		MAX(timestamp)
 		FROM command_events
 		GROUP BY command_name
-		ORDER BY COUNT(*) DESC, command_name ASC`
+		ORDER BY MAX(timestamp) DESC, command_name ASC`
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -136,29 +341,31 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 			return nil, err
 		}
 		return []Row{
-			{Label: "uncached input", Totals: withDerived(Totals{TotalTokens: totals.InputTokens, InputTokens: totals.InputTokens})},
-			{Label: "cache read", Totals: withDerived(Totals{TotalTokens: totals.CachedInputTokens, CachedInputTokens: totals.CachedInputTokens})},
+			{Label: "uncached input", Totals: withDerived(Totals{TotalTokens: totals.InputTokens, InputTokens: totals.InputTokens, Credits: tokenTypeCredits(ctx, db, "input_tokens", where, args...)})},
+			{Label: "cache read", Totals: withDerived(Totals{TotalTokens: totals.CachedInputTokens, CachedInputTokens: totals.CachedInputTokens, Credits: tokenTypeCredits(ctx, db, "cached_input_tokens", where, args...)})},
 			{Label: "cache creation", Totals: withDerived(Totals{})},
-			{Label: "output", Totals: Totals{TotalTokens: totals.OutputTokens, OutputTokens: totals.OutputTokens}},
-			{Label: "reasoning output", Totals: Totals{TotalTokens: totals.ReasoningOutputTokens, ReasoningOutputTokens: totals.ReasoningOutputTokens}},
+			{Label: "output", Totals: Totals{TotalTokens: totals.OutputTokens, OutputTokens: totals.OutputTokens, Credits: tokenTypeCredits(ctx, db, "output_tokens", where, args...)}},
+			{Label: "reasoning output", Totals: Totals{TotalTokens: totals.ReasoningOutputTokens, ReasoningOutputTokens: totals.ReasoningOutputTokens, Credits: tokenTypeCredits(ctx, db, "reasoning_output_tokens", where, args...)}},
 		}, nil
 	}
 
 	query := fmt.Sprintf(`SELECT %s AS label,
 		SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
-		SUM(reasoning_output_tokens), SUM(total_tokens)
-		FROM token_events`, groupExpr)
+		SUM(reasoning_output_tokens), SUM(total_tokens), SUM(`+creditExpr+`), MAX(timestamp)
+		FROM token_events`+creditJoins, groupExpr)
 	if groupExpr == "session_id" {
 		query = `WITH source_meta AS (
-			SELECT session_id, MAX(session_dir) AS session_dir, SUM(function_call_count) AS function_call_count
+			SELECT session_id, MAX(session_dir) AS session_dir, MAX(model) AS model, SUM(function_call_count) AS function_call_count
 			FROM source_files
 			GROUP BY session_id
 		)
 		SELECT token_events.session_id AS label,
 		SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
 		SUM(reasoning_output_tokens), SUM(total_tokens),
-		COALESCE(source_meta.session_dir, ''), COALESCE(source_meta.function_call_count, 0)
-		FROM token_events
+		SUM(` + creditExpr + `),
+		MAX(timestamp),
+		COALESCE(source_meta.session_dir, ''), COALESCE(source_meta.model, ''), COALESCE(source_meta.function_call_count, 0)
+		FROM token_events` + creditJoins + `
 		LEFT JOIN source_meta ON source_meta.session_id = token_events.session_id`
 	}
 	if where != "" {
@@ -166,11 +373,11 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 	}
 	query += " GROUP BY label"
 	if groupExpr == "session_id" {
-		query += ", source_meta.session_dir, source_meta.function_call_count"
+		query += ", source_meta.session_dir, source_meta.model, source_meta.function_call_count"
 	}
-	query += " ORDER BY SUM(total_tokens) DESC"
+	query += " ORDER BY MAX(timestamp) DESC"
 	if groupExpr == "substr(timestamp, 1, 10)" || strings.Contains(groupExpr, "12, 2") {
-		query = strings.Replace(query, "ORDER BY SUM(total_tokens) DESC", "ORDER BY label ASC", 1)
+		query = strings.Replace(query, "ORDER BY MAX(timestamp) DESC", "ORDER BY label DESC", 1)
 	}
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
@@ -193,7 +400,10 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 				&row.Totals.OutputTokens,
 				&row.Totals.ReasoningOutputTokens,
 				&row.Totals.TotalTokens,
+				&row.Totals.Credits,
+				&row.LastSeen,
 				&row.Directory,
+				&row.Model,
 				&row.FunctionCalls,
 			); err != nil {
 				return nil, err
@@ -206,6 +416,8 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 				&row.Totals.OutputTokens,
 				&row.Totals.ReasoningOutputTokens,
 				&row.Totals.TotalTokens,
+				&row.Totals.Credits,
+				&row.LastSeen,
 			); err != nil {
 				return nil, err
 			}
@@ -224,9 +436,6 @@ func queryReasoning(ctx context.Context, db *store.DB, groupExpr string) ([]Row,
 	if err := attachFunctionCallsByDate(ctx, db, rows); err != nil {
 		return nil, err
 	}
-	sort.SliceStable(rows, func(i, j int) bool {
-		return rows[i].Label < rows[j].Label
-	})
 	return rows, nil
 }
 
@@ -262,7 +471,7 @@ func attachFunctionCallsByDate(ctx context.Context, db *store.DB, rows []Row) er
 }
 
 func queryTotals(ctx context.Context, db *store.DB, where string, args ...any) (Totals, error) {
-	query := `SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(reasoning_output_tokens), 0), COALESCE(SUM(total_tokens), 0) FROM token_events`
+	query := `SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(reasoning_output_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(` + creditExpr + `), 0) FROM token_events` + creditJoins
 	if where != "" {
 		query += " WHERE " + where
 	}
@@ -273,11 +482,40 @@ func queryTotals(ctx context.Context, db *store.DB, where string, args ...any) (
 	defer rows.Close()
 	var totals Totals
 	if rows.Next() {
-		if err := rows.Scan(&totals.InputTokens, &totals.CachedInputTokens, &totals.OutputTokens, &totals.ReasoningOutputTokens, &totals.TotalTokens); err != nil {
+		if err := rows.Scan(&totals.InputTokens, &totals.CachedInputTokens, &totals.OutputTokens, &totals.ReasoningOutputTokens, &totals.TotalTokens, &totals.Credits); err != nil {
 			return Totals{}, err
 		}
 	}
 	return withDerived(totals), rows.Err()
+}
+
+func tokenTypeCredits(ctx context.Context, db *store.DB, column, where string, args ...any) float64 {
+	rateColumn := map[string]string{
+		"input_tokens":            "input_credits_per_million",
+		"cached_input_tokens":     "cached_input_credits_per_million",
+		"output_tokens":           "output_credits_per_million",
+		"reasoning_output_tokens": "reasoning_credits_per_million",
+	}[column]
+	if rateColumn == "" {
+		return 0
+	}
+	query := fmt.Sprintf(`SELECT COALESCE(SUM(token_events.%s * COALESCE(rate.%s, fallback.%s)) / 1000000.0, 0)
+		FROM token_events%s`, column, rateColumn, rateColumn, creditJoins)
+	if where != "" {
+		query += " WHERE " + where
+	}
+	rows, err := db.Query(ctx, query, args...)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	var credits float64
+	if rows.Next() {
+		if err := rows.Scan(&credits); err != nil {
+			return 0
+		}
+	}
+	return credits
 }
 
 func Render(data Data, view string) string {
@@ -294,6 +532,24 @@ func Render(data Data, view string) string {
 		writeCommandRows(&b, data.Rows)
 		return b.String()
 	}
+	if view == "payload" {
+		writePayloadSummary(&b, data)
+		if len(data.Rows) == 0 {
+			b.WriteString("\nNo payload events found.\n")
+			return b.String()
+		}
+		b.WriteString("\n")
+		if data.Session != "" {
+			writePayloadSessionRows(&b, data.Rows)
+		} else {
+			writePayloadRows(&b, data.Rows)
+		}
+		return b.String()
+	}
+	if view == "summary" {
+		writeWeeklySummary(&b, data.Rows)
+		return b.String()
+	}
 	writeTotals(&b, data.Totals)
 	if len(data.Rows) == 0 {
 		b.WriteString("\nNo token events found.\n")
@@ -301,11 +557,11 @@ func Render(data Data, view string) string {
 	}
 	b.WriteString("\n")
 	switch view {
-	case "daily", "hourly", "cache", "reasoning":
+	case "daily", "cache", "reasoning":
 		writeGraph(&b, data.Rows, view)
 		b.WriteString("\n")
 	}
-	writeRows(&b, data.Rows, view)
+	writeRows(&b, data.Rows, view, data.SelectedIndex)
 	return b.String()
 }
 
@@ -318,8 +574,35 @@ func writeCommandSummary(b *strings.Builder, rows []Row) {
 	fmt.Fprintf(b, "Commands: %d  Calls: %s  Session refs: %s\n", len(rows), formatInt(calls), formatInt(sessions))
 }
 
+func writeWeeklySummary(b *strings.Builder, rows []Row) {
+	var credits float64
+	var calls int64
+	for _, row := range rows {
+		credits += row.Totals.Credits
+		calls += row.FunctionCalls
+	}
+	fmt.Fprintf(b, "Weekly credits: %s  Function calls: %s\n\n", formatCredits(credits), formatInt(calls))
+	tableRows := [][]string{{"Week", "Credits", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls", "Last Seen"}}
+	for _, row := range rows {
+		tableRows = append(tableRows, []string{
+			row.Label,
+			formatCredits(row.Totals.Credits),
+			formatInt(row.Totals.TotalTokens),
+			formatInt(row.Totals.UncachedInputTokens),
+			formatInt(row.Totals.CacheReadInputTokens),
+			fmt.Sprintf("%.1f%%", row.Totals.CacheHitRate*100),
+			formatInt(row.FunctionCalls),
+			compactTime(row.LastSeen),
+		})
+	}
+	columns := columnsFor(tableRows)
+	for _, row := range tableRows {
+		writeTableLine(b, columns, row)
+	}
+}
+
 func writeCommandRows(b *strings.Builder, rows []Row) {
-	tableRows := [][]string{{"Command", "Kind", "Calls", "Sessions", "Directories", "First Seen", "Last Seen"}}
+	tableRows := [][]string{{"Command", "Kind", "FCalls", "Sessions", "Directories", "First Seen", "Last Seen"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
 			truncate(row.Label, 28),
@@ -337,8 +620,89 @@ func writeCommandRows(b *strings.Builder, rows []Row) {
 	}
 }
 
+func writePayloadSummary(b *strings.Builder, data Data) {
+	if data.Session == "" {
+		var count, bytes int64
+		for _, row := range data.Rows {
+			count += row.Count
+			bytes += row.PayloadBytes
+		}
+		fmt.Fprintf(b, "Payload groups: %d  Events: %s  Payload bytes: %s\n", len(data.Rows), formatInt(count), formatInt(bytes))
+		return
+	}
+	fmt.Fprintf(b, "Session: %s\n", data.Session)
+	if len(data.Summary) == 0 {
+		return
+	}
+	tableRows := [][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT", "First Seen", "Last Seen"}}
+	for _, row := range data.Summary {
+		tableRows = append(tableRows, []string{
+			truncate(row.Label, 26),
+			truncate(row.Phase, 12),
+			formatInt(row.Count),
+			formatInt(row.PayloadBytes),
+			formatInt(row.AvgBytes),
+			formatInt(row.MaxBytes),
+			formatDuration(row.AvgDurationMS),
+			formatDuration(row.MaxDurationMS),
+			formatDuration(row.AvgTTFTMS),
+			compactTime(row.FirstSeen),
+			compactTime(row.LastSeen),
+		})
+	}
+	columns := columnsFor(tableRows)
+	for _, row := range tableRows {
+		writeTableLine(b, columns, row)
+	}
+}
+
+func writePayloadRows(b *strings.Builder, rows []Row) {
+	tableRows := [][]string{{"Payload", "Phase", "Count", "Payload Bytes", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT", "Last Seen"}}
+	for _, row := range rows {
+		tableRows = append(tableRows, []string{
+			truncate(row.Label, 30),
+			truncate(row.Phase, 12),
+			formatInt(row.Count),
+			formatInt(row.PayloadBytes),
+			formatInt(row.AvgBytes),
+			formatInt(row.MaxBytes),
+			formatDuration(row.AvgDurationMS),
+			formatDuration(row.MaxDurationMS),
+			formatDuration(row.AvgTTFTMS),
+			compactTime(row.LastSeen),
+		})
+	}
+	columns := columnsFor(tableRows)
+	for _, row := range tableRows {
+		writeTableLine(b, columns, row)
+	}
+}
+
+func writePayloadSessionRows(b *strings.Builder, rows []Row) {
+	tableRows := [][]string{{"Interaction", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Payload Bytes", "Dur", "TTFT", "Hit Rate"}}
+	for _, row := range rows {
+		tableRows = append(tableRows, []string{
+			compactTime(row.Label),
+			formatInt(row.Totals.TotalTokens),
+			formatInt(row.Totals.UncachedInputTokens),
+			formatInt(row.Totals.CacheReadInputTokens),
+			formatInt(row.Totals.OutputTokens),
+			formatInt(row.Totals.ReasoningOutputTokens),
+			formatInt(row.PayloadBytes),
+			formatDuration(row.AvgDurationMS),
+			formatDuration(row.AvgTTFTMS),
+			fmt.Sprintf("%.1f%%", row.Totals.CacheHitRate*100),
+		})
+	}
+	columns := columnsFor(tableRows)
+	for _, row := range tableRows {
+		writeTableLine(b, columns, row)
+	}
+}
+
 func writeTotals(b *strings.Builder, totals Totals) {
-	fmt.Fprintf(b, "Total: %s  Uncached: %s  Cache read: %s  Cache creation: %s  Output: %s  Reasoning: %s  Cache hit: %.1f%%\n",
+	fmt.Fprintf(b, "Credits: %s  Total: %s  Uncached: %s  Cache read: %s  Cache creation: %s  Output: %s  Reasoning: %s  Cache hit: %.1f%%\n",
+		formatCredits(totals.Credits),
 		formatInt(totals.TotalTokens),
 		formatInt(totals.UncachedInputTokens),
 		formatInt(totals.CacheReadInputTokens),
@@ -349,27 +713,39 @@ func writeTotals(b *strings.Builder, totals Totals) {
 	)
 }
 
-func writeRows(b *strings.Builder, rows []Row, view string) {
+func writeRows(b *strings.Builder, rows []Row, view string, selectedIndex int) {
 	includeDirectory := hasDirectory(rows)
+	includeModel := view == "sessions" && hasModel(rows)
 	includeCalls := view == "sessions" || view == "reasoning" || hasFunctionCalls(rows)
 	headers := []string{"Group"}
 	if includeDirectory {
 		headers = append(headers, "Directory")
 	}
-	if includeCalls {
-		headers = append(headers, "Calls")
+	if includeModel {
+		headers = append(headers, "Model")
 	}
-	headers = append(headers, "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Hit Rate")
+	if includeCalls {
+		headers = append(headers, "FCalls")
+	}
+	headers = append(headers, "Credits", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Hit Rate")
 	tableRows := [][]string{headers}
-	for _, row := range rows {
-		values := []string{truncate(row.Label, 36)}
+	for i, row := range rows {
+		label := row.Label
+		if view == "sessions" && i == selectedIndex {
+			label = "> " + label
+		}
+		values := []string{truncate(label, 36)}
 		if includeDirectory {
-			values = append(values, truncate(row.Directory, 32))
+			values = append(values, truncate(shortDirectory(row.Directory), 32))
+		}
+		if includeModel {
+			values = append(values, truncate(row.Model, 14))
 		}
 		if includeCalls {
 			values = append(values, formatInt(row.FunctionCalls))
 		}
 		values = append(values,
+			formatCredits(row.Totals.Credits),
 			formatInt(row.Totals.TotalTokens),
 			formatInt(row.Totals.UncachedInputTokens),
 			formatInt(row.Totals.CacheReadInputTokens),
@@ -422,20 +798,38 @@ func tableColumnFor(header string) tableColumn {
 	switch header {
 	case "Command":
 		return tableColumn{width: 28, align: alignLeft}
+	case "Payload":
+		return tableColumn{width: 30, align: alignLeft}
+	case "Metric":
+		return tableColumn{width: 26, align: alignLeft}
+	case "Interaction":
+		return tableColumn{width: 16, align: alignCenter}
 	case "Kind":
 		return tableColumn{width: 14, align: alignCenter}
 	case "Group":
 		return tableColumn{width: 36, align: alignLeft}
+	case "Week":
+		return tableColumn{width: 9, align: alignLeft}
 	case "Directory":
 		return tableColumn{width: 32, align: alignLeft}
+	case "Model":
+		return tableColumn{width: 14, align: alignCenter}
 	case "Directories":
 		return tableColumn{width: 12, align: alignCenter}
 	case "Sessions":
 		return tableColumn{width: 10, align: alignCenter}
 	case "First Seen", "Last Seen":
 		return tableColumn{width: 16, align: alignCenter}
-	case "Calls":
+	case "Count", "FCalls":
 		return tableColumn{width: 8, align: alignCenter}
+	case "Credits":
+		return tableColumn{width: 10, align: alignCenter}
+	case "Payload Bytes":
+		return tableColumn{width: 13, align: alignCenter}
+	case "Payload Total", "Avg Bytes", "Max Bytes":
+		return tableColumn{width: 10, align: alignCenter}
+	case "Avg Dur", "Max Dur", "Avg TTFT", "Dur", "TTFT":
+		return tableColumn{width: 9, align: alignCenter}
 	case "Hit Rate":
 		return tableColumn{width: 10, align: alignCenter}
 	default:
@@ -517,6 +911,7 @@ func addTotals(a, b Totals) Totals {
 		OutputTokens:             a.OutputTokens + b.OutputTokens,
 		ReasoningOutputTokens:    a.ReasoningOutputTokens + b.ReasoningOutputTokens,
 		TotalTokens:              a.TotalTokens + b.TotalTokens,
+		Credits:                  a.Credits + b.Credits,
 	})
 }
 
@@ -544,6 +939,19 @@ func formatInt(n int64) string {
 		return "-" + formatInt(-n)
 	}
 	return formatCompactFloat(float64(n))
+}
+
+func formatCredits(n float64) string {
+	if n < 0 {
+		return "-" + formatCredits(-n)
+	}
+	if n == 0 {
+		return "0"
+	}
+	if n < 1 {
+		return trimCompactFloat(n)
+	}
+	return formatCompactFloat(n)
 }
 
 func formatCompactFloat(n float64) string {
@@ -601,9 +1009,65 @@ func compactTime(value string) string {
 	return value
 }
 
+func formatDuration(ms int64) string {
+	if ms <= 0 {
+		return "0ms"
+	}
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	seconds := float64(ms) / 1000
+	if seconds < 60 {
+		return trimCompactFloat(seconds) + "s"
+	}
+	minutes := seconds / 60
+	return trimCompactFloat(minutes) + "m"
+}
+
+func diffMillis(start, end string) int64 {
+	if start == "" || end == "" {
+		return 0
+	}
+	startTime, err := time.Parse(time.RFC3339Nano, start)
+	if err != nil {
+		return 0
+	}
+	endTime, err := time.Parse(time.RFC3339Nano, end)
+	if err != nil {
+		return 0
+	}
+	if endTime.Before(startTime) {
+		return 0
+	}
+	return endTime.Sub(startTime).Milliseconds()
+}
+
+func shortDirectory(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	cleaned := filepath.Clean(path)
+	parent := filepath.Base(filepath.Dir(cleaned))
+	base := filepath.Base(cleaned)
+	if parent == "." || parent == string(filepath.Separator) || parent == "" {
+		return base
+	}
+	return filepath.Join(parent, base)
+}
+
 func hasDirectory(rows []Row) bool {
 	for _, row := range rows {
 		if row.Directory != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasModel(rows []Row) bool {
+	for _, row := range rows {
+		if row.Model != "" {
 			return true
 		}
 	}

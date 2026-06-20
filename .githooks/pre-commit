@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "Formatting Go files..."
 go fmt ./...
+
+if ! git diff --quiet; then
+  echo "go fmt changed files. Review and stage the formatting changes, then commit again."
+  exit 1
+fi
+
 go test ./...

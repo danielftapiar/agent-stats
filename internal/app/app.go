@@ -23,6 +23,7 @@ type options struct {
 	cachePath   string
 	jsonOutput  bool
 	limit       int
+	sessionID   string
 }
 
 func Run(ctx context.Context, args []string, out io.Writer) error {
@@ -49,7 +50,7 @@ func Run(ctx context.Context, args []string, out io.Writer) error {
 	switch cmd {
 	case "", "tui":
 		return tui.Run(ctx, db, indexer)
-	case "summary", "today", "daily", "sessions", "hourly", "cache", "reasoning", "commands", "tokens", "top", "graph":
+	case "summary", "today", "daily", "sessions", "cache", "reasoning", "commands", "payload", "tokens", "top", "graph":
 		return printView(ctx, out, db, cmd, opts)
 	case "export":
 		return exportJSON(ctx, out, db)
@@ -100,6 +101,8 @@ func parseArgs(args []string) (options, string, error) {
 			}
 			if cmd == "" {
 				cmd = arg
+			} else if cmd == "payload" {
+				opts.sessionID = arg
 			}
 		}
 	}
@@ -110,7 +113,15 @@ func printView(ctx context.Context, out io.Writer, db *store.DB, cmd string, opt
 	if cmd == "graph" {
 		cmd = "daily"
 	}
-	data, err := views.Load(ctx, db, cmd, opts.limit, time.Now())
+	var (
+		data views.Data
+		err  error
+	)
+	if cmd == "payload" && opts.sessionID != "" {
+		data, err = views.LoadSessionPayload(ctx, db, opts.sessionID, opts.limit)
+	} else {
+		data, err = views.Load(ctx, db, cmd, opts.limit, time.Now())
+	}
 	if err != nil {
 		return err
 	}
@@ -140,10 +151,10 @@ Usage:
   agent-stats today [--json]
   agent-stats daily
   agent-stats sessions [--limit 20]
-  agent-stats hourly
   agent-stats cache
   agent-stats reasoning
   agent-stats commands
+  agent-stats payload [session-id]
   agent-stats tokens
   agent-stats top [--limit 20]
   agent-stats export
