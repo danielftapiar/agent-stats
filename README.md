@@ -56,6 +56,7 @@ agent-stats today
 agent-stats graph
 agent-stats graph --since 7d
 agent-stats sessions --limit 20
+agent-stats commands --limit 20
 agent-stats export --format json
 ```
 
@@ -72,6 +73,7 @@ Useful views:
 - `hourly`: usage grouped by hour of day to show active working periods.
 - `cache`: cache hit rate grouped by day or session.
 - `reasoning`: reasoning output tokens grouped by day or session.
+- `commands`: function calls grouped by command name, with call count, session count, directory count, and first/last seen timestamps.
 - `tokens`: input, cached input, output, and reasoning output grouped together for direct comparison.
 - `top`: highest-usage sessions grouped by total tokens.
 
@@ -86,6 +88,7 @@ Useful group-by combinations:
 | `cache --group day` | day | cache hit/miss | Tracking cache efficiency over time |
 | `cache --group session` | session | cache hit/miss | Finding sessions with poor cache reuse |
 | `reasoning --group day` | day | reasoning output | Tracking reasoning-heavy usage |
+| `commands` | command name | function call metadata | Finding the tools and shell commands used most often |
 | `top --by total` | session | total tokens | Ranking the biggest sessions |
 | `top --by cached` | session | cached input tokens | Seeing where cache reuse is high |
 | `top --by output` | session | output tokens | Finding output-heavy sessions |
@@ -113,6 +116,7 @@ Interactive mode should support colon commands for switching views:
 :hourly
 :cache
 :reasoning
+:commands
 :tokens
 :top
 :help
@@ -122,15 +126,15 @@ Interactive mode should support colon commands for switching views:
 The same views should also be available as numbered tabs across the top of the UI:
 
 ```text
-1 Summary  2 Today  3 Daily  4 Sessions  5 Hourly  6 Cache  7 Reasoning  8 Tokens  9 Top
+1 Summary  2 Today  3 Daily  4 Sessions  5 Hourly  6 Cache  7 Reasoning  8 Commands  9 Tokens  10 Top
 ```
 
 Keyboard behavior:
 
 - Press `:` to focus the command prompt.
 - Type a view command such as `:daily` and press `Enter` to switch views.
-- Press `1` through `9` to switch directly to the matching tab.
-- Press `Tab` and `Shift+Tab` to move to the next or previous view.
+- Press `1` through `9` to switch directly to the first nine tabs.
+- Press `Tab` and `Shift+Tab` to move to the next or previous view, including tabs beyond `9`.
 - Press `?` to show available commands.
 - Press `q` or run `:quit` to exit.
 
@@ -306,8 +310,19 @@ CREATE TABLE token_events (
   model_context_window INTEGER
 );
 
+CREATE TABLE command_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  timestamp TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  command_name TEXT NOT NULL,
+  session_dir TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX token_events_timestamp_idx ON token_events(timestamp);
 CREATE INDEX token_events_session_idx ON token_events(session_id);
+CREATE INDEX command_events_command_name_idx ON command_events(command_name);
 ```
 
 The `token_events` table should store per-event increments, not cumulative totals. That keeps every view simple:
@@ -317,6 +332,7 @@ The `token_events` table should store per-event increments, not cumulative total
 - `hourly`: group by hour.
 - `sessions`: group by `session_id`.
 - `cache`: calculate from summed `cached_input_tokens` and `input_tokens`.
+- `commands`: group `command_events` by `command_name`.
 
 Startup algorithm:
 
@@ -327,7 +343,8 @@ Startup algorithm:
 5. If new, parse from byte offset `0`.
 6. If changed and larger, seek to `processed_offset` and parse only appended lines.
 7. If changed and smaller, delete that file's cached events and reprocess from `0`.
-8. Update `source_files` in the same transaction as inserted events.
+8. Store `response_item` function calls in `command_events` with command name, timestamp, session, and session directory.
+9. Update `source_files` in the same transaction as inserted events.
 
 Interactive streaming algorithm:
 

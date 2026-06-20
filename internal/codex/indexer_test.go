@@ -10,10 +10,11 @@ func TestParseFileUsesLastTokenUsage(t *testing.T) {
 {"timestamp":"2026-06-20T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":70,"output_tokens":20,"reasoning_output_tokens":3,"total_tokens":170},"last_token_usage":{"input_tokens":50,"cached_input_tokens":30,"output_tokens":10,"reasoning_output_tokens":1,"total_tokens":60},"model_context_window":258400}}}
 `)
 
-	events, _, _, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{})
+	result, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := result.Events
 	if len(events) != 2 {
 		t.Fatalf("expected 2 events, got %d", len(events))
 	}
@@ -27,10 +28,11 @@ func TestParseFileFallsBackToCumulativeDelta(t *testing.T) {
 {"timestamp":"2026-06-20T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":70,"output_tokens":20,"reasoning_output_tokens":3,"total_tokens":170}}}}
 `)
 
-	events, _, _, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{})
+	result, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := result.Events
 	if len(events) != 2 {
 		t.Fatalf("expected 2 events, got %d", len(events))
 	}
@@ -48,10 +50,11 @@ func TestParseFileSkipsMalformedAndInfoNullLines(t *testing.T) {
 {"timestamp":"2026-06-20T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}
 `)
 
-	events, _, _, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{})
+	result, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := result.Events
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
@@ -66,10 +69,12 @@ func TestParseFileDedupesRepeatedCumulativeTotalsEvenWithLastUsage(t *testing.T)
 {"timestamp":"2026-06-20T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":160,"cached_input_tokens":70,"output_tokens":20,"reasoning_output_tokens":3,"total_tokens":180},"last_token_usage":{"input_tokens":60,"cached_input_tokens":30,"output_tokens":10,"reasoning_output_tokens":1,"total_tokens":70},"model_context_window":258400}}}
 `)
 
-	events, _, checkpoint, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{})
+	result, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := result.Events
+	checkpoint := result.Checkpoint
 	if len(events) != 2 {
 		t.Fatalf("expected duplicate cumulative event to be skipped, got %d events", len(events))
 	}
@@ -93,10 +98,12 @@ func TestParseFileDedupesFirstAppendedEventAgainstSavedCheckpoint(t *testing.T) 
 		TotalTokens:           110,
 	}
 
-	events, _, nextCheckpoint, err := ParseFile(input, "rollout.jsonl", "session", 1024, checkpoint)
+	result, err := ParseFile(input, "rollout.jsonl", "session", 1024, checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := result.Events
+	nextCheckpoint := result.Checkpoint
 	if len(events) != 1 {
 		t.Fatalf("expected first appended duplicate to be skipped, got %d events", len(events))
 	}
@@ -105,5 +112,30 @@ func TestParseFileDedupesFirstAppendedEventAgainstSavedCheckpoint(t *testing.T) 
 	}
 	if nextCheckpoint.TotalTokens != 180 {
 		t.Fatalf("expected checkpoint to advance to 180, got %+v", nextCheckpoint)
+	}
+}
+
+func TestParseFileExtractsSessionDirectoryAndFunctionCalls(t *testing.T) {
+	input := strings.NewReader(`{"timestamp":"2026-06-20T09:00:00Z","type":"session_meta","payload":{"id":"session","cwd":"/Users/example/project"}}
+{"timestamp":"2026-06-20T09:01:00Z","type":"response_item","payload":{"type":"function_call","name":"shell"}}
+{"timestamp":"2026-06-20T09:02:00Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch"}}
+{"timestamp":"2026-06-20T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}
+`)
+
+	result, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SessionDir != "/Users/example/project" {
+		t.Fatalf("expected session directory, got %q", result.SessionDir)
+	}
+	if len(result.Commands) != 2 {
+		t.Fatalf("expected 2 function calls, got %d", len(result.Commands))
+	}
+	if result.Commands[0].CommandName != "shell" || result.Commands[1].CommandName != "apply_patch" {
+		t.Fatalf("unexpected command names: %+v", result.Commands)
+	}
+	if len(result.Events) != 1 {
+		t.Fatalf("expected token event to still be parsed, got %d", len(result.Events))
 	}
 }
