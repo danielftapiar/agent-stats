@@ -450,12 +450,20 @@ func (m model) themeContent(content string) string {
 		case isTableHeader(line):
 			lines[i] = m.theme.TableHeader.Render(line)
 		case isSelectedLine(line):
-			lines[i] = m.theme.SelectedRow.Width(m.contentWidth()).Render(line)
+			lines[i] = m.theme.SelectedRow.Width(m.selectedRowWidth(line)).Render(line)
 		case strings.ContainsAny(line, "┤┼╭╮╯╰─│"):
 			lines[i] = m.theme.Graph.Render(line)
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m model) selectedRowWidth(line string) int {
+	width := lipgloss.Width(line)
+	if contentWidth := m.contentWidth(); width < contentWidth {
+		return contentWidth
+	}
+	return width
 }
 
 func (m model) contentWidth() int {

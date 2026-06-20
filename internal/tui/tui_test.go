@@ -83,6 +83,35 @@ func TestVimKeysScrollHorizontally(t *testing.T) {
 	}
 }
 
+func TestSelectedRowCanScrollHorizontallyInSmallWindow(t *testing.T) {
+	m := newTestModel(views.Data{
+		View:          "sessions",
+		SelectedIndex: 0,
+		Rows: []views.Row{{
+			Label:     "session-with-a-long-visible-row",
+			Directory: "/Users/example/some/really/long/project/path",
+			Model:     "gpt-5.5-codex",
+			Totals:    views.Totals{InputTokens: 1000, TotalTokens: 1000},
+		}},
+	})
+	m.active = viewIndex("sessions")
+	m.width = 36
+	m.height = 12
+	m.configureViewport()
+	m.setViewportContent()
+	before := m.viewport.View()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(model)
+	afterRight := m.viewport.View()
+	if before == afterRight {
+		t.Fatal("expected selected row to preserve horizontal overflow for scrolling")
+	}
+	if m.selectedRowWidth("> session-with-a-long-visible-row") <= m.contentWidth() {
+		t.Fatal("expected selected row style width to preserve the full row width")
+	}
+}
+
 func TestDeleteSessionRequiresTypingYes(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
