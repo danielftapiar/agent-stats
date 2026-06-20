@@ -54,6 +54,7 @@ type model struct {
 	session       string
 	interaction   string
 	summaryWeek   string
+	sessionsDay   string
 	pendingDelete string
 }
 
@@ -130,9 +131,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = commandHelp()
 			return m, nil
 		case "enter":
-			if viewNames[m.active] == "summary" && m.summaryWeek == "" && len(m.data.Rows) > 0 {
+			if viewNames[m.active] == "summary" && len(m.data.Rows) > 0 {
 				m.clampSummaryRow()
-				m.summaryWeek = m.data.Rows[m.summaryRow].PeriodStart
+				if m.summaryWeek == "" {
+					m.summaryWeek = m.data.Rows[m.summaryRow].PeriodStart
+					m.summaryRow = 0
+				} else {
+					m.sessionsDay = m.data.Rows[m.summaryRow].PeriodStart
+					m.summaryWeek = ""
+					m.summaryRow = 0
+					m.row = 0
+					if idx := viewIndex("sessions"); idx >= 0 {
+						m.active = idx
+					}
+				}
 				m.reload()
 				return m, nil
 			}
@@ -165,6 +177,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.reload()
 				return m, nil
 			}
+			if viewNames[m.active] == "sessions" && m.sessionsDay != "" {
+				m.sessionsDay = ""
+				m.reload()
+				return m, nil
+			}
 			if viewNames[m.active] == "payload" && m.interaction != "" {
 				m.interaction = ""
 				m.reload()
@@ -182,7 +199,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.ScrollLeft(8)
 			return m, nil
 		case "j", "down":
-			if viewNames[m.active] == "summary" && m.summaryWeek == "" && len(m.data.Rows) > 0 {
+			if viewNames[m.active] == "summary" && len(m.data.Rows) > 0 {
 				m.summaryRow++
 				m.clampSummaryRow()
 				m.setViewportContent()
@@ -203,7 +220,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "k", "up":
-			if viewNames[m.active] == "summary" && m.summaryWeek == "" && len(m.data.Rows) > 0 {
+			if viewNames[m.active] == "summary" && len(m.data.Rows) > 0 {
 				m.summaryRow--
 				m.clampSummaryRow()
 				m.setViewportContent()
@@ -228,6 +245,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.session = ""
 			m.interaction = ""
 			m.summaryWeek = ""
+			m.sessionsDay = ""
 			m.reload()
 			return m, nil
 		case "shift+tab":
@@ -238,6 +256,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.session = ""
 			m.interaction = ""
 			m.summaryWeek = ""
+			m.sessionsDay = ""
 			m.reload()
 			return m, nil
 		}
@@ -250,6 +269,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.session = ""
 					m.interaction = ""
 					m.summaryWeek = ""
+					m.sessionsDay = ""
 					m.reload()
 				}
 			}
@@ -292,6 +312,7 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if value != "summary" {
 				m.summaryWeek = ""
 			}
+			m.sessionsDay = ""
 			m.err = ""
 			m.reload()
 		} else if value == "help" {
@@ -372,6 +393,8 @@ func (m *model) reload() {
 	)
 	if viewNames[m.active] == "summary" && m.summaryWeek != "" {
 		data, err = views.LoadSummaryWeek(m.ctx, m.db, m.summaryWeek)
+	} else if viewNames[m.active] == "sessions" && m.sessionsDay != "" {
+		data, err = views.LoadSessionsForDay(m.ctx, m.db, m.sessionsDay, 20)
 	} else if viewNames[m.active] == "payload" && m.session != "" {
 		if m.interaction != "" {
 			data, err = views.LoadPayloadInteraction(m.ctx, m.db, m.session, m.interaction)
@@ -394,7 +417,7 @@ func (m *model) reload() {
 		}
 		data.SelectedIndex = m.row
 	}
-	if viewNames[m.active] == "summary" && m.summaryWeek == "" {
+	if viewNames[m.active] == "summary" {
 		if m.summaryRow >= len(data.Rows) {
 			m.summaryRow = len(data.Rows) - 1
 		}
@@ -471,13 +494,13 @@ func (m model) renderContent() string {
 	if viewNames[m.active] == "sessions" {
 		m.data.SelectedIndex = m.row
 	}
-	if viewNames[m.active] == "summary" && m.summaryWeek == "" {
+	if viewNames[m.active] == "summary" {
 		m.data.SelectedIndex = m.summaryRow
 	}
 	if m.inSessionPayload() && m.interaction == "" {
 		m.data.SelectedIndex = m.payloadRow
 	}
-	return m.themeContent(views.Render(m.data, viewNames[m.active]))
+	return m.themeContent(views.RenderWithWidth(m.data, viewNames[m.active], m.contentWidth()))
 }
 
 func (m model) themeContent(content string) string {
@@ -591,6 +614,7 @@ func (m *model) deleteSession(sessionID string) {
 	m.err = fmt.Sprintf("deleted session %s", sessionID)
 	m.session = ""
 	m.interaction = ""
+	m.sessionsDay = ""
 	m.reload()
 }
 

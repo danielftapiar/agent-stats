@@ -70,6 +70,15 @@ func TestLoadTodayAggregatesTokenEvents(t *testing.T) {
 	if data.Rows[0].Totals.CacheReadInputTokens != 60 {
 		t.Fatalf("expected cache read tokens 60, got %d", data.Rows[0].Totals.CacheReadInputTokens)
 	}
+	if len(data.GraphRows) != 24 {
+		t.Fatalf("expected 24 hourly graph rows, got %d", len(data.GraphRows))
+	}
+	if data.GraphRows[0].Label != "00:00" || data.GraphRows[23].Label != "23:59" {
+		t.Fatalf("expected graph to span 00:00 through 23:00, got first=%q last=%q", data.GraphRows[0].Label, data.GraphRows[23].Label)
+	}
+	if data.GraphRows[10].Totals.TotalTokens != 15 || data.GraphRows[11].Totals.TotalTokens != 30 {
+		t.Fatalf("expected hourly token totals at 10:00 and 11:00, got %d and %d", data.GraphRows[10].Totals.TotalTokens, data.GraphRows[11].Totals.TotalTokens)
+	}
 }
 
 func TestWithDerivedTreatsCachedInputAsInputSubset(t *testing.T) {
@@ -214,10 +223,13 @@ func TestLoadSummaryWeekGroupsDaysWithGraph(t *testing.T) {
 		t.Fatalf("expected 2 day rows in selected week, got %d", len(data.Rows))
 	}
 	rendered := Render(data, "summary")
-	for _, want := range []string{"Week 2026 May 18th daily credits", "Days:", "Day", "2026 May 19th", "2026 May 18th"} {
+	for _, want := range []string{"Week 2026 May 18th daily credits", "Day", "2026 May 19th", "2026 May 18th"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected weekly drilldown summary to contain %q:\n%s", want, rendered)
 		}
+	}
+	if strings.Contains(rendered, "Days:") {
+		t.Fatalf("expected summary graph x-axis labels to be omitted:\n%s", rendered)
 	}
 }
 
@@ -494,7 +506,6 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 	rendered := strings.Join(lines, "\n")
 	for _, want := range []string{
 		"Week", "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls",
-		"Weeks: 2026 May 11th 2026 May 18th",
 		"2026 May 18th", "████████░░░░░░░░░░░░ 4.2K/10K", "1.74B", "76.8M", "1.66B", "95.6%", "1.23K",
 		"2026 May 11th", "░░░░░░░░░░░░░░░░░░░░ 0.5/10K", "1.2K",
 	} {
@@ -504,6 +515,9 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 	}
 	if strings.Contains(rendered, "Week             Credits") {
 		t.Fatalf("expected summary table to omit standalone Credits column:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "Weeks:") {
+		t.Fatalf("expected summary graph x-axis labels to be omitted:\n%s", rendered)
 	}
 	if strings.Contains(rendered, "#") {
 		t.Fatalf("expected summary progress bars to use rendered block glyphs, got:\n%s", rendered)

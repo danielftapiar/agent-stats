@@ -161,10 +161,25 @@ func TestSummaryVimSelectionDrillsIntoSelectedWeek(t *testing.T) {
 		t.Fatalf("expected day drilldown data, got period %q", m.data.Period)
 	}
 
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if viewNames[m.active] != "sessions" {
+		t.Fatalf("expected selecting a day to switch to sessions, got %q", viewNames[m.active])
+	}
+	if m.sessionsDay != "2026-05-18" {
+		t.Fatalf("expected sessions to be filtered by selected day, got %q", m.sessionsDay)
+	}
+	if m.data.Period != "day" || m.data.PeriodStart != "2026-05-18" {
+		t.Fatalf("expected day-filtered sessions data, got period=%q start=%q", m.data.Period, m.data.PeriodStart)
+	}
+	if len(m.data.Rows) != 1 || m.data.Rows[0].Label != "session-a" {
+		t.Fatalf("expected filtered session-a row, got %#v", m.data.Rows)
+	}
+
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(model)
-	if m.summaryWeek != "" {
-		t.Fatalf("expected escape to return to weekly summary, got %q", m.summaryWeek)
+	if m.sessionsDay != "" {
+		t.Fatalf("expected escape to clear sessions day filter, got %q", m.sessionsDay)
 	}
 }
 

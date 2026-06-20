@@ -57,6 +57,7 @@ type Data struct {
 	Interaction   string `json:"interaction,omitempty"`
 	SelectedIndex int    `json:"selected_index,omitempty"`
 	Summary       []Row  `json:"summary,omitempty"`
+	GraphRows     []Row  `json:"graph_rows,omitempty"`
 	Totals        Totals `json:"totals"`
 	Rows          []Row  `json:"rows"`
 }
@@ -83,6 +84,17 @@ func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Ti
 	case "today":
 		start := now.Format("2006-01-02")
 		rows, err = queryGrouped(ctx, db, "session_id", "timestamp >= ?", limitOrDefault(limit), start)
+		if err != nil {
+			return Data{}, err
+		}
+		graphRows, err := queryTodayHourlyGraph(ctx, db, start)
+		if err != nil {
+			return Data{}, err
+		}
+		data := Data{View: view, Rows: rows, GraphRows: graphRows}
+		data.Totals = sumRows(rows)
+		data.Totals.CacheHitRate = cacheHitRate(data.Totals)
+		return data, nil
 	case "sessions":
 		rows, err = queryGrouped(ctx, db, "session_id", "", limitOrDefault(limit))
 	case "top":
@@ -101,6 +113,17 @@ func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Ti
 	for _, row := range rows {
 		data.Totals = addTotals(data.Totals, row.Totals)
 	}
+	data.Totals.CacheHitRate = cacheHitRate(data.Totals)
+	return data, nil
+}
+
+func LoadSessionsForDay(ctx context.Context, db *store.DB, day string, limit int) (Data, error) {
+	rows, err := queryGrouped(ctx, db, "session_id", "timestamp >= ? AND timestamp < date(?, '+1 day')", limitOrDefault(limit), day, day)
+	if err != nil {
+		return Data{}, err
+	}
+	data := Data{View: "sessions", Period: "day", PeriodStart: day, SelectedIndex: -1, Rows: rows}
+	data.Totals = sumRows(rows)
 	data.Totals.CacheHitRate = cacheHitRate(data.Totals)
 	return data, nil
 }
@@ -265,6 +288,40 @@ func queryDailySummaryForWeek(ctx context.Context, db *store.DB, weekStart strin
 		row.PeriodStart = row.Label
 		row.Label = formatDateLabel(row.Label)
 		row.Totals = withDerived(row.Totals)
+		rows = append(rows, row)
+	}
+	return rows, sqlRows.Err()
+}
+
+func queryTodayHourlyGraph(ctx context.Context, db *store.DB, day string) ([]Row, error) {
+	query := `WITH RECURSIVE hours(hour) AS (
+		SELECT 0
+		UNION ALL
+		SELECT hour + 1 FROM hours WHERE hour < 23
+	),
+	hourly AS (
+		SELECT CAST(strftime('%H', timestamp) AS INTEGER) AS hour,
+			SUM(total_tokens) AS total_tokens
+		FROM token_events
+		WHERE timestamp >= ? AND timestamp < date(?, '+1 day')
+		GROUP BY hour
+	)
+	SELECT CASE WHEN hours.hour = 23 THEN '23:59' ELSE printf('%02d:00', hours.hour) END,
+		COALESCE(hourly.total_tokens, 0)
+	FROM hours
+	LEFT JOIN hourly ON hourly.hour = hours.hour
+	ORDER BY hours.hour`
+	sqlRows, err := db.Query(ctx, query, day, day)
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+	rows := make([]Row, 0, 24)
+	for sqlRows.Next() {
+		var row Row
+		if err := sqlRows.Scan(&row.Label, &row.Totals.TotalTokens); err != nil {
+			return nil, err
+		}
 		rows = append(rows, row)
 	}
 	return rows, sqlRows.Err()
@@ -721,6 +778,10 @@ func tokenTypeCredits(ctx context.Context, db *store.DB, column, where string, a
 }
 
 func Render(data Data, view string) string {
+	return RenderWithWidth(data, view, 0)
+}
+
+func RenderWithWidth(data Data, view string, width int) string {
 	var b strings.Builder
 	data.Totals = withDerived(data.Totals)
 	fmt.Fprintf(&b, "%s\n\n", strings.ToUpper(view))
@@ -763,8 +824,15 @@ func Render(data Data, view string) string {
 	b.WriteString("\n")
 	switch view {
 	case "today":
-		writeGraph(&b, data.Rows, view)
+		graphRows := data.GraphRows
+		if len(graphRows) == 0 {
+			graphRows = data.Rows
+		}
+		writeGraph(&b, graphRows, view, width)
 		b.WriteString("\n")
+	}
+	if view == "sessions" && data.Period == "day" && data.PeriodStart != "" {
+		fmt.Fprintf(&b, "Day: %s\n\n", formatDateLabel(data.PeriodStart))
 	}
 	writeRows(&b, data.Rows, view, data.SelectedIndex)
 	return b.String()
@@ -791,7 +859,7 @@ func writeSummary(b *strings.Builder, data Data) {
 	} else {
 		fmt.Fprintf(b, "Weekly credits: %s  Function calls: %s\n\n", formatCredits(credits), formatInt(calls))
 	}
-	writeCreditsGraph(b, data.Rows, summaryAxisLabel(data))
+	writeCreditsGraph(b, data.Rows)
 	b.WriteString("\n")
 	tableRows := [][]string{{summaryFirstColumn(data), "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls"}}
 	for i, row := range data.Rows {
@@ -820,13 +888,6 @@ func summaryFirstColumn(data Data) string {
 		return "Day"
 	}
 	return "Week"
-}
-
-func summaryAxisLabel(data Data) string {
-	if data.Period == "day" {
-		return "Days"
-	}
-	return "Weeks"
 }
 
 func writeCommandRows(b *strings.Builder, rows []Row) {
@@ -1110,7 +1171,7 @@ func displayWidth(value string) int {
 	return lipgloss.Width(value)
 }
 
-func writeGraph(b *strings.Builder, rows []Row, view string) {
+func writeGraph(b *strings.Builder, rows []Row, view string, width int) {
 	values := make([]float64, 0, len(rows))
 	for _, row := range rows {
 		values = append(values, float64(row.Totals.TotalTokens))
@@ -1118,32 +1179,28 @@ func writeGraph(b *strings.Builder, rows []Row, view string) {
 	if len(values) == 0 {
 		return
 	}
-	b.WriteString(asciigraph.Plot(values, asciigraph.Height(8), asciigraph.YAxisValueFormatter(graphValueFormatter(view))))
+	options := []asciigraph.Option{
+		asciigraph.Height(8),
+		asciigraph.YAxisValueFormatter(graphValueFormatter(view)),
+	}
+	if width > 0 {
+		options = append(options, asciigraph.Width(width))
+	}
+	b.WriteString(asciigraph.Plot(values, options...))
 	b.WriteString("\n")
 }
 
-func writeCreditsGraph(b *strings.Builder, rows []Row, axisLabel string) {
+func writeCreditsGraph(b *strings.Builder, rows []Row) {
 	if len(rows) == 0 {
 		return
 	}
 	values := make([]float64, 0, len(rows))
-	labels := make([]string, 0, len(rows))
 	for i := len(rows) - 1; i >= 0; i-- {
 		values = append(values, rows[i].Totals.Credits)
-		labels = append(labels, rows[i].Label)
 	}
 	b.WriteString(asciigraph.Plot(values, asciigraph.Height(8), asciigraph.YAxisValueFormatter(func(value float64) string {
 		return formatCredits(value)
 	})))
-	if axisLabel != "" {
-		b.WriteByte('\n')
-		b.WriteString(axisLabel)
-	} else {
-		b.WriteString("\n")
-		b.WriteString("Weeks")
-	}
-	b.WriteString(": ")
-	b.WriteString(strings.Join(labels, " "))
 	b.WriteString("\n")
 }
 
@@ -1151,6 +1208,14 @@ func graphValueFormatter(view string) func(float64) string {
 	return func(value float64) string {
 		return formatCompactFloat(value)
 	}
+}
+
+func sumRows(rows []Row) Totals {
+	var totals Totals
+	for _, row := range rows {
+		totals = addTotals(totals, row.Totals)
+	}
+	return withDerived(totals)
 }
 
 const weeklyCreditBudget = 10_000
