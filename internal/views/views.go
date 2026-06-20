@@ -1002,10 +1002,11 @@ func writeRows(b *strings.Builder, rows []Row, view string, selectedIndex int) {
 	if includeModel {
 		headers = append(headers, "Model")
 	}
+	headers = append(headers, "Credits")
 	if includeCalls {
 		headers = append(headers, "FCalls")
 	}
-	headers = append(headers, "Credits", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Hit Rate")
+	headers = append(headers, "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Hit Rate")
 	tableRows := [][]string{headers}
 	for i, row := range rows {
 		label := row.Label
@@ -1019,11 +1020,11 @@ func writeRows(b *strings.Builder, rows []Row, view string, selectedIndex int) {
 		if includeModel {
 			values = append(values, truncate(row.Model, 14))
 		}
+		values = append(values, formatCredits(row.Totals.Credits))
 		if includeCalls {
 			values = append(values, formatInt(row.FunctionCalls))
 		}
 		values = append(values,
-			formatCredits(row.Totals.Credits),
 			formatInt(row.Totals.TotalTokens),
 			formatInt(row.Totals.UncachedInputTokens),
 			formatInt(row.Totals.CacheReadInputTokens),

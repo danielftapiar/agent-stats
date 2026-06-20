@@ -303,6 +303,44 @@ func TestRenderSessionsMarksSelectedRow(t *testing.T) {
 	}
 }
 
+func TestRenderRowsPlacesCreditsImmediatelyBeforeFCalls(t *testing.T) {
+	data := Data{
+		View: "sessions",
+		Rows: []Row{{
+			Label:         "session-a",
+			FunctionCalls: 3,
+			Totals:        withDerived(Totals{TotalTokens: 10, InputTokens: 10, Credits: 42}),
+		}},
+	}
+
+	rendered := Render(data, "sessions")
+	var header string
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.HasPrefix(line, "Group") {
+			header = line
+			break
+		}
+	}
+	if header == "" {
+		t.Fatalf("expected sessions table header:\n%s", rendered)
+	}
+	headerIndex := strings.Index(header, "Credits")
+	if headerIndex == -1 {
+		t.Fatalf("expected Credits column:\n%s", header)
+	}
+	fcallsIndex := strings.Index(header, "FCalls")
+	if fcallsIndex == -1 {
+		t.Fatalf("expected FCalls column:\n%s", header)
+	}
+	if headerIndex > fcallsIndex {
+		t.Fatalf("expected Credits to be left of FCalls:\n%s", header)
+	}
+	between := header[headerIndex+len("Credits") : fcallsIndex]
+	if strings.Contains(strings.TrimSpace(between), "Total") {
+		t.Fatalf("expected Credits immediately before FCalls, got intervening header content %q:\n%s", between, header)
+	}
+}
+
 func TestLoadReasoningIncludesFunctionCallsByDay(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
