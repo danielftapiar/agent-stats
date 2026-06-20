@@ -8,7 +8,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/danieltapia/agent-stats/internal/codex"
 	"github.com/danieltapia/agent-stats/internal/store"
 	"github.com/danieltapia/agent-stats/internal/views"
@@ -40,6 +39,7 @@ type model struct {
 	width    int
 	height   int
 	lastSync time.Time
+	theme    theme
 }
 
 func Run(ctx context.Context, db *store.DB, indexer *codex.Indexer) error {
@@ -54,11 +54,15 @@ func newModel(ctx context.Context, db *store.DB, indexer *codex.Indexer) model {
 	input.Prompt = ":"
 	input.Placeholder = "summary"
 	input.CharLimit = 32
+	t := defaultTheme()
+	input.PromptStyle = t.Prompt
+	input.TextStyle = t.Prompt
 	m := model{
 		ctx:     ctx,
 		db:      db,
 		indexer: indexer,
 		input:   input,
+		theme:   t,
 	}
 	m.reload()
 	return m
@@ -167,23 +171,26 @@ func (m *model) reload() {
 
 func (m model) View() string {
 	var b strings.Builder
+	b.WriteString(m.theme.Title.Render("agent-stats"))
+	b.WriteString("\n")
 	b.WriteString(m.renderTabs())
 	b.WriteString("\n")
 	b.WriteString(views.Render(m.data, viewNames[m.active]))
 	b.WriteString("\n")
 	if !m.lastSync.IsZero() {
-		fmt.Fprintf(&b, "Last sync: %s\n", m.lastSync.Format("15:04:05"))
+		b.WriteString(m.theme.Status.Render(fmt.Sprintf("Last sync: %s", m.lastSync.Format("15:04:05"))))
+		b.WriteString("\n")
 	}
 	if m.err != "" {
-		b.WriteString(errorStyle.Render(m.err))
+		b.WriteString(m.theme.Error.Render(m.err))
 		b.WriteString("\n")
 	}
 	if m.prompt {
 		b.WriteString(m.input.View())
 	} else {
-		b.WriteString(helpStyle.Render("Press : for commands, 1-9 for tabs, Tab/Shift+Tab to switch, q to quit"))
+		b.WriteString(m.theme.Help.Render("Press : for commands, 1-9 for tabs, Tab/Shift+Tab to switch, q to quit"))
 	}
-	return b.String()
+	return m.theme.Frame.Render(b.String())
 }
 
 func (m model) renderTabs() string {
@@ -191,9 +198,9 @@ func (m model) renderTabs() string {
 	for i, name := range viewNames {
 		label := fmt.Sprintf("%d %s", i+1, strings.Title(name))
 		if i == m.active {
-			parts = append(parts, activeTabStyle.Render(label))
+			parts = append(parts, m.theme.ActiveTab.Render(label))
 		} else {
-			parts = append(parts, tabStyle.Render(label))
+			parts = append(parts, m.theme.Tab.Render(label))
 		}
 	}
 	return strings.Join(parts, " ")
@@ -214,18 +221,3 @@ func viewIndex(name string) int {
 	}
 	return -1
 }
-
-var (
-	tabStyle = lipgloss.NewStyle().
-			Padding(0, 1).
-			Foreground(lipgloss.Color("244"))
-	activeTabStyle = lipgloss.NewStyle().
-			Padding(0, 1).
-			Foreground(lipgloss.Color("230")).
-			Background(lipgloss.Color("30")).
-			Bold(true)
-	errorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("196"))
-	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("244"))
-)
