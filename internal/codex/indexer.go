@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -99,6 +100,19 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		meta = store.SourceFile{}
 		found = false
 	}
+	if found {
+		hasPayloads, err := i.db.HasPayloadEvents(ctx, path)
+		if err != nil {
+			return err
+		}
+		if !hasPayloads {
+			if err := i.db.DeleteSourceFileEvents(ctx, path); err != nil {
+				return err
+			}
+			meta = store.SourceFile{}
+			found = false
+		}
+	}
 	if found && meta.SizeBytes == size && meta.ModTimeUnix == modTime {
 		return nil
 	}
@@ -155,7 +169,7 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 	for i := range result.Commands {
 		result.Commands[i].SessionDir = source.SessionDir
 	}
-	return i.db.SaveFileSyncWithCommands(ctx, source, result.Events, result.Commands)
+	return i.db.SaveFileSyncWithDetails(ctx, source, result.Events, result.Commands, result.Payloads)
 }
 
 func SessionID(path string) string {
@@ -164,16 +178,23 @@ func SessionID(path string) string {
 }
 
 type rawLine struct {
-	Timestamp string     `json:"timestamp"`
-	Type      string     `json:"type"`
-	Payload   rawPayload `json:"payload"`
+	Timestamp string          `json:"timestamp"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
 type rawPayload struct {
-	Type string   `json:"type"`
-	Info *rawInfo `json:"info"`
-	CWD  string   `json:"cwd"`
-	Name string   `json:"name"`
+	Type               string          `json:"type"`
+	Info               *rawInfo        `json:"info"`
+	CWD                string          `json:"cwd"`
+	Name               string          `json:"name"`
+	Namespace          string          `json:"namespace"`
+	Arguments          string          `json:"arguments"`
+	Phase              string          `json:"phase"`
+	CompletedAt        string          `json:"completed_at"`
+	DurationMS         json.RawMessage `json:"duration_ms"`
+	TimeToFirstTokenMS json.RawMessage `json:"time_to_first_token_ms"`
+	CallID             string          `json:"call_id"`
 }
 
 type rawInfo struct {
@@ -196,6 +217,7 @@ type ParseResult struct {
 	Checkpoint rawUsage
 	SessionDir string
 	Commands   []store.CommandEvent
+	Payloads   []store.PayloadEvent
 }
 
 func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, initialPrevious rawUsage) (ParseResult, error) {
@@ -217,33 +239,73 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 		if err := json.Unmarshal(line, &raw); err != nil {
 			continue
 		}
-		if raw.Type == "session_meta" && raw.Payload.CWD != "" {
-			result.SessionDir = raw.Payload.CWD
+		var payload rawPayload
+		if len(raw.Payload) > 0 {
+			if err := json.Unmarshal(raw.Payload, &payload); err != nil {
+				payload = rawPayload{}
+			}
+		}
+		payloadEvent := store.PayloadEvent{
+			SessionID:          sessionID,
+			SourcePath:         sourcePath,
+			Timestamp:          raw.Timestamp,
+			TopLevelType:       raw.Type,
+			PayloadType:        payload.Type,
+			Phase:              payload.Phase,
+			PayloadBytes:       int64(len(raw.Payload)),
+			CompletedAt:        payload.CompletedAt,
+			DurationMS:         rawInt64(payload.DurationMS),
+			TimeToFirstTokenMS: rawInt64(payload.TimeToFirstTokenMS),
+			CommandName:        commandName(payload.Name),
+			NormalizedCommand:  normalizedPayloadCommand(payload),
+			CallID:             payload.CallID,
+			PayloadJSON:        string(raw.Payload),
+			RawJSON:            string(line),
+		}
+		if payloadEvent.PayloadType == "" {
+			payloadEvent.PayloadType = "(none)"
+		}
+		if payloadEvent.CommandName == "(unknown)" {
+			payloadEvent.CommandName = ""
+		}
+		if raw.Type == "session_meta" && payload.CWD != "" {
+			result.SessionDir = payload.CWD
+			result.Payloads = append(result.Payloads, payloadEvent)
 			continue
 		}
-		if raw.Type == "response_item" && raw.Payload.Type == "function_call" {
+		if raw.Type == "response_item" && payload.Type == "function_call" {
 			result.Commands = append(result.Commands, store.CommandEvent{
 				SessionID:   sessionID,
 				SourcePath:  sourcePath,
 				Timestamp:   raw.Timestamp,
-				EventType:   raw.Payload.Type,
-				CommandName: commandName(raw.Payload.Name),
+				EventType:   payload.Type,
+				CommandName: commandName(payload.Name),
 				SessionDir:  result.SessionDir,
 			})
+			result.Payloads = append(result.Payloads, payloadEvent)
 			continue
 		}
-		if raw.Payload.Type != "token_count" || raw.Payload.Info == nil {
+		if payload.Type != "token_count" || payload.Info == nil {
+			result.Payloads = append(result.Payloads, payloadEvent)
 			continue
 		}
 
-		current := normalizeTotal(raw.Payload.Info.TotalTokenUsage)
+		current := normalizeTotal(payload.Info.TotalTokenUsage)
 		if hasPrevious && current.equal(previous) {
+			result.Payloads = append(result.Payloads, payloadEvent)
 			continue
 		}
-		usage, ok := eventUsage(raw.Payload.Info, previous, hasPrevious)
+		usage, ok := eventUsage(payload.Info, previous, hasPrevious)
 		previous = current
 		result.Checkpoint = previous
 		hasPrevious = true
+		payloadEvent.InputTokens = usage.InputTokens
+		payloadEvent.CachedInputTokens = usage.CachedInputTokens
+		payloadEvent.OutputTokens = usage.OutputTokens
+		payloadEvent.ReasoningOutputTokens = usage.ReasoningOutputTokens
+		payloadEvent.TotalTokens = usage.TotalTokens
+		payloadEvent.ModelContextWindow = payload.Info.ModelContextSize
+		result.Payloads = append(result.Payloads, payloadEvent)
 		if !ok || usage.TotalTokens <= 0 {
 			continue
 		}
@@ -257,7 +319,7 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 			OutputTokens:          usage.OutputTokens,
 			ReasoningOutputTokens: usage.ReasoningOutputTokens,
 			TotalTokens:           usage.TotalTokens,
-			ModelContextWindow:    raw.Payload.Info.ModelContextSize,
+			ModelContextWindow:    payload.Info.ModelContextSize,
 		})
 	}
 	if err := scanner.Err(); err != nil {
@@ -278,6 +340,58 @@ func commandName(name string) string {
 		return "(unknown)"
 	}
 	return name
+}
+
+func rawInt64(raw json.RawMessage) int64 {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err == nil {
+		return int64(f)
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if parsed, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func normalizedPayloadCommand(payload rawPayload) string {
+	if payload.Type != "function_call" || payload.Name == "" {
+		return ""
+	}
+	if payload.Name != "exec_command" {
+		return payload.Name
+	}
+	var args struct {
+		Cmd string `json:"cmd"`
+	}
+	if err := json.Unmarshal([]byte(payload.Arguments), &args); err != nil {
+		return payload.Name
+	}
+	return normalizeShellCommand(args.Cmd)
+}
+
+func normalizeShellCommand(cmd string) string {
+	fields := strings.Fields(cmd)
+	for len(fields) > 0 && (fields[0] == "rtk" || strings.HasPrefix(fields[0], "rtk=")) {
+		fields = fields[1:]
+	}
+	if len(fields) == 0 {
+		return ""
+	}
+	base := filepath.Base(fields[0])
+	if base == "" {
+		return fields[0]
+	}
+	return base
 }
 
 func eventUsage(info *rawInfo, previous rawUsage, hasPrevious bool) (rawUsage, bool) {

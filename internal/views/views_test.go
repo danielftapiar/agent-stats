@@ -161,8 +161,27 @@ func TestLoadSessionsIncludesDirectoryAndFunctionCalls(t *testing.T) {
 	}
 
 	rendered := Render(data, "sessions")
-	if !strings.Contains(rendered, "Directory") || !strings.Contains(rendered, "Calls") {
-		t.Fatalf("expected rendered sessions table to include Directory and Calls columns:\n%s", rendered)
+	if !strings.Contains(rendered, "Directory") || !strings.Contains(rendered, "FCalls") {
+		t.Fatalf("expected rendered sessions table to include Directory and FCalls columns:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "example/project") || strings.Contains(rendered, "/Users/example/project") {
+		t.Fatalf("expected rendered directory to use last two path components:\n%s", rendered)
+	}
+}
+
+func TestRenderSessionsMarksSelectedRow(t *testing.T) {
+	data := Data{
+		View:          "sessions",
+		SelectedIndex: 1,
+		Rows: []Row{
+			{Label: "session-a", Totals: withDerived(Totals{TotalTokens: 10, InputTokens: 10})},
+			{Label: "session-b", Totals: withDerived(Totals{TotalTokens: 20, InputTokens: 20})},
+		},
+	}
+
+	rendered := Render(data, "sessions")
+	if !strings.Contains(rendered, "> session-b") {
+		t.Fatalf("expected selected session marker on second row:\n%s", rendered)
 	}
 }
 
@@ -208,8 +227,8 @@ func TestLoadReasoningIncludesFunctionCallsByDay(t *testing.T) {
 		t.Fatalf("expected 3 function calls, got %d", data.Rows[0].FunctionCalls)
 	}
 	rendered := Render(data, "reasoning")
-	if !strings.Contains(rendered, "Calls") {
-		t.Fatalf("expected rendered reasoning table to include Calls column:\n%s", rendered)
+	if !strings.Contains(rendered, "FCalls") {
+		t.Fatalf("expected rendered reasoning table to include FCalls column:\n%s", rendered)
 	}
 }
 
@@ -247,22 +266,77 @@ func TestLoadCommandsGroupsByCommandName(t *testing.T) {
 	if len(data.Rows) != 2 {
 		t.Fatalf("expected 2 command rows, got %d", len(data.Rows))
 	}
-	if data.Rows[0].Label != "shell" {
-		t.Fatalf("expected shell to rank first, got %q", data.Rows[0].Label)
+	if data.Rows[0].Label != "apply_patch" {
+		t.Fatalf("expected newest command to rank first, got %q", data.Rows[0].Label)
 	}
 	if data.Rows[0].EventType != "function_call" {
 		t.Fatalf("expected function_call kind, got %q", data.Rows[0].EventType)
 	}
-	if data.Rows[0].FunctionCalls != 2 {
-		t.Fatalf("expected 2 shell calls, got %d", data.Rows[0].FunctionCalls)
+	if data.Rows[0].FunctionCalls != 1 {
+		t.Fatalf("expected 1 apply_patch call, got %d", data.Rows[0].FunctionCalls)
 	}
 	if data.Rows[0].SessionCount != 1 {
-		t.Fatalf("expected 1 shell session, got %d", data.Rows[0].SessionCount)
+		t.Fatalf("expected 1 apply_patch session, got %d", data.Rows[0].SessionCount)
 	}
 	rendered := Render(data, "commands")
-	for _, want := range []string{"Command", "Kind", "Calls", "Sessions", "Directories", "First Seen", "Last Seen"} {
+	for _, want := range []string{"Command", "Kind", "FCalls", "Sessions", "Directories", "First Seen", "Last Seen"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected rendered commands table to include %q:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestLoadPayloadSummariesAndSessionInteractions(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	source := store.SourceFile{
+		Path:            "source.jsonl",
+		SizeBytes:       10,
+		ModTimeUnix:     1,
+		ProcessedOffset: 10,
+		SessionID:       "session-a",
+		LastSeenAt:      "2026-06-20T10:02:00Z",
+	}
+	payloads := []store.PayloadEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", TopLevelType: "event_msg", PayloadType: "agent_message", Phase: "commentary", PayloadBytes: 100},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:00Z", TopLevelType: "response_item", PayloadType: "function_call", CommandName: "exec_command", NormalizedCommand: "sed", PayloadBytes: 200},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:02:00Z", TopLevelType: "event_msg", PayloadType: "token_count", PayloadBytes: 300, InputTokens: 10, CachedInputTokens: 5, OutputTokens: 4, ReasoningOutputTokens: 1, TotalTokens: 14},
+	}
+	if err := db.SaveFileSyncWithDetails(ctx, source, nil, nil, payloads); err != nil {
+		t.Fatal(err)
+	}
+
+	global, err := Load(ctx, db, "payload", 20, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(global.Rows) != 3 {
+		t.Fatalf("expected 3 payload groups, got %d", len(global.Rows))
+	}
+	renderedGlobal := Render(global, "payload")
+	if !strings.Contains(renderedGlobal, "Payload groups") || !strings.Contains(renderedGlobal, "Payload Bytes") {
+		t.Fatalf("expected global payload summary table:\n%s", renderedGlobal)
+	}
+
+	session, err := LoadSessionPayload(ctx, db, "session-a", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(session.Rows) != 1 {
+		t.Fatalf("expected 1 interaction row, got %d", len(session.Rows))
+	}
+	if session.Rows[0].Totals.TotalTokens != 14 {
+		t.Fatalf("expected interaction total tokens 14, got %d", session.Rows[0].Totals.TotalTokens)
+	}
+	renderedSession := Render(session, "payload")
+	for _, want := range []string{"Session: session-a", "most used command", "Interaction", "Payload Bytes"} {
+		if !strings.Contains(renderedSession, want) {
+			t.Fatalf("expected session payload drilldown to contain %q:\n%s", want, renderedSession)
 		}
 	}
 }

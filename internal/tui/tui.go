@@ -26,6 +26,7 @@ var viewNames = []string{
 	"cache",
 	"reasoning",
 	"commands",
+	"payload",
 	"tokens",
 	"top",
 }
@@ -48,6 +49,8 @@ type model struct {
 	themes   []namedTheme
 	selected int
 	preview  int
+	row      int
+	session  string
 }
 
 func Run(ctx context.Context, db *store.DB, indexer *codex.Indexer) error {
@@ -118,8 +121,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "?":
 			m.err = commandHelp()
 			return m, nil
+		case "enter":
+			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
+				if m.row < 0 {
+					m.row = 0
+				}
+				if m.row >= len(m.data.Rows) {
+					m.row = len(m.data.Rows) - 1
+				}
+				m.session = m.data.Rows[m.row].Label
+				if strings.HasPrefix(m.session, "> ") {
+					m.session = strings.TrimPrefix(m.session, "> ")
+				}
+				if idx := viewIndex("payload"); idx >= 0 {
+					m.active = idx
+				}
+				m.reload()
+				return m, nil
+			}
+		case "j", "down":
+			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
+				m.row++
+				if m.row >= len(m.data.Rows) {
+					m.row = len(m.data.Rows) - 1
+				}
+				m.setViewportContent()
+				return m, nil
+			}
+		case "k", "up":
+			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
+				m.row--
+				if m.row < 0 {
+					m.row = 0
+				}
+				m.setViewportContent()
+				return m, nil
+			}
 		case "tab":
 			m.active = (m.active + 1) % len(viewNames)
+			m.session = ""
 			m.reload()
 			return m, nil
 		case "shift+tab":
@@ -127,6 +167,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.active < 0 {
 				m.active = len(viewNames) - 1
 			}
+			m.session = ""
 			m.reload()
 			return m, nil
 		}
@@ -136,6 +177,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				next := int(key - '1')
 				if next < len(viewNames) {
 					m.active = next
+					m.session = ""
 					m.reload()
 				}
 			}
@@ -171,6 +213,9 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if idx := viewIndex(value); idx >= 0 {
 			m.active = idx
+			if value != "payload" {
+				m.session = ""
+			}
 			m.err = ""
 			m.reload()
 		} else if value == "help" {
@@ -186,7 +231,7 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func commandHelp() string {
-	return "commands: :summary :today :daily :sessions :hourly :cache :reasoning :commands :tokens :top :theme :quit"
+	return "commands: :summary :today :daily :sessions :hourly :cache :reasoning :commands :payload :tokens :top :theme :quit"
 }
 
 func (m model) updateThemePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -222,10 +267,27 @@ func (m model) updateThemePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) reload() {
-	data, err := views.Load(m.ctx, m.db, viewNames[m.active], 20, time.Now())
+	var (
+		data views.Data
+		err  error
+	)
+	if viewNames[m.active] == "payload" && m.session != "" {
+		data, err = views.LoadSessionPayload(m.ctx, m.db, m.session, 20)
+	} else {
+		data, err = views.Load(m.ctx, m.db, viewNames[m.active], 20, time.Now())
+	}
 	if err != nil {
 		m.err = err.Error()
 		return
+	}
+	if viewNames[m.active] == "sessions" {
+		if m.row >= len(data.Rows) {
+			m.row = len(data.Rows) - 1
+		}
+		if m.row < 0 {
+			m.row = 0
+		}
+		data.SelectedIndex = m.row
 	}
 	m.data = data
 	m.setViewportContent()
@@ -280,6 +342,9 @@ func (m model) View() string {
 }
 
 func (m model) renderContent() string {
+	if viewNames[m.active] == "sessions" {
+		m.data.SelectedIndex = m.row
+	}
 	return m.themeContent(views.Render(m.data, viewNames[m.active]))
 }
 

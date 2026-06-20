@@ -54,6 +54,31 @@ type CommandEvent struct {
 	SessionDir  string `json:"session_dir,omitempty"`
 }
 
+type PayloadEvent struct {
+	ID                    int64  `json:"id,omitempty"`
+	SessionID             string `json:"session_id"`
+	SourcePath            string `json:"source_path"`
+	Timestamp             string `json:"timestamp"`
+	TopLevelType          string `json:"top_level_type"`
+	PayloadType           string `json:"payload_type"`
+	Phase                 string `json:"phase,omitempty"`
+	PayloadBytes          int64  `json:"payload_bytes"`
+	CompletedAt           string `json:"completed_at,omitempty"`
+	DurationMS            int64  `json:"duration_ms,omitempty"`
+	TimeToFirstTokenMS    int64  `json:"time_to_first_token_ms,omitempty"`
+	CommandName           string `json:"command_name,omitempty"`
+	NormalizedCommand     string `json:"normalized_command,omitempty"`
+	CallID                string `json:"call_id,omitempty"`
+	InputTokens           int64  `json:"input_tokens,omitempty"`
+	CachedInputTokens     int64  `json:"cached_input_tokens,omitempty"`
+	OutputTokens          int64  `json:"output_tokens,omitempty"`
+	ReasoningOutputTokens int64  `json:"reasoning_output_tokens,omitempty"`
+	TotalTokens           int64  `json:"total_tokens,omitempty"`
+	ModelContextWindow    int64  `json:"model_context_window,omitempty"`
+	PayloadJSON           string `json:"payload_json,omitempty"`
+	RawJSON               string `json:"raw_json,omitempty"`
+}
+
 func DefaultCachePath() string {
 	if dir, err := os.UserCacheDir(); err == nil {
 		return filepath.Join(dir, "agent-stats", "codex-usage.db")
@@ -139,6 +164,35 @@ func (db *DB) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS command_events_session_idx ON command_events(session_id)`,
 		`CREATE INDEX IF NOT EXISTS command_events_source_path_idx ON command_events(source_path)`,
 		`CREATE INDEX IF NOT EXISTS command_events_command_name_idx ON command_events(command_name)`,
+		`CREATE TABLE IF NOT EXISTS payload_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			source_path TEXT NOT NULL,
+			timestamp TEXT NOT NULL,
+			top_level_type TEXT NOT NULL,
+			payload_type TEXT NOT NULL,
+			phase TEXT NOT NULL DEFAULT '',
+			payload_bytes INTEGER NOT NULL,
+			completed_at TEXT NOT NULL DEFAULT '',
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			time_to_first_token_ms INTEGER NOT NULL DEFAULT 0,
+			command_name TEXT NOT NULL DEFAULT '',
+			normalized_command TEXT NOT NULL DEFAULT '',
+			call_id TEXT NOT NULL DEFAULT '',
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			model_context_window INTEGER NOT NULL DEFAULT 0,
+			payload_json TEXT NOT NULL DEFAULT '',
+			raw_json TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS payload_events_timestamp_idx ON payload_events(timestamp)`,
+		`CREATE INDEX IF NOT EXISTS payload_events_session_idx ON payload_events(session_id)`,
+		`CREATE INDEX IF NOT EXISTS payload_events_source_path_idx ON payload_events(source_path)`,
+		`CREATE INDEX IF NOT EXISTS payload_events_type_idx ON payload_events(top_level_type, payload_type, phase)`,
+		`CREATE INDEX IF NOT EXISTS payload_events_normalized_command_idx ON payload_events(normalized_command)`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.sql.ExecContext(ctx, stmt); err != nil {
@@ -193,6 +247,15 @@ func (db *DB) SourceFile(ctx context.Context, path string) (SourceFile, bool, er
 	return sf, true, nil
 }
 
+func (db *DB) HasPayloadEvents(ctx context.Context, path string) (bool, error) {
+	row := db.sql.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM payload_events WHERE source_path = ? LIMIT 1)`, path)
+	var exists bool
+	if err := row.Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 func (db *DB) DeleteSourceFileEvents(ctx context.Context, path string) error {
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
@@ -206,6 +269,10 @@ func (db *DB) DeleteSourceFileEvents(ctx context.Context, path string) error {
 		tx.Rollback()
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM payload_events WHERE source_path = ?`, path); err != nil {
+		tx.Rollback()
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM source_files WHERE path = ?`, path); err != nil {
 		tx.Rollback()
 		return err
@@ -214,10 +281,14 @@ func (db *DB) DeleteSourceFileEvents(ctx context.Context, path string) error {
 }
 
 func (db *DB) SaveFileSync(ctx context.Context, source SourceFile, events []TokenEvent) error {
-	return db.SaveFileSyncWithCommands(ctx, source, events, nil)
+	return db.SaveFileSyncWithDetails(ctx, source, events, nil, nil)
 }
 
 func (db *DB) SaveFileSyncWithCommands(ctx context.Context, source SourceFile, events []TokenEvent, commands []CommandEvent) error {
+	return db.SaveFileSyncWithDetails(ctx, source, events, commands, nil)
+}
+
+func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, events []TokenEvent, commands []CommandEvent, payloads []PayloadEvent) error {
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -251,6 +322,39 @@ func (db *DB) SaveFileSyncWithCommands(ctx context.Context, source SourceFile, e
 			command.EventType,
 			command.CommandName,
 			command.SessionDir,
+		); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	for _, payload := range payloads {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO payload_events (
+			session_id, source_path, timestamp, top_level_type, payload_type, phase, payload_bytes,
+			completed_at, duration_ms, time_to_first_token_ms, command_name, normalized_command, call_id,
+			input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+			model_context_window, payload_json, raw_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			payload.SessionID,
+			payload.SourcePath,
+			payload.Timestamp,
+			payload.TopLevelType,
+			payload.PayloadType,
+			payload.Phase,
+			payload.PayloadBytes,
+			payload.CompletedAt,
+			payload.DurationMS,
+			payload.TimeToFirstTokenMS,
+			payload.CommandName,
+			payload.NormalizedCommand,
+			payload.CallID,
+			payload.InputTokens,
+			payload.CachedInputTokens,
+			payload.OutputTokens,
+			payload.ReasoningOutputTokens,
+			payload.TotalTokens,
+			payload.ModelContextWindow,
+			payload.PayloadJSON,
+			payload.RawJSON,
 		); err != nil {
 			tx.Rollback()
 			return err
@@ -312,7 +416,7 @@ func (db *DB) Query(ctx context.Context, query string, args ...any) (*sql.Rows, 
 }
 
 func (db *DB) Events(ctx context.Context) ([]TokenEvent, error) {
-	rows, err := db.sql.QueryContext(ctx, `SELECT id, session_id, source_path, timestamp, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, COALESCE(model_context_window, 0) FROM token_events ORDER BY timestamp, id`)
+	rows, err := db.sql.QueryContext(ctx, `SELECT id, session_id, source_path, timestamp, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, COALESCE(model_context_window, 0) FROM token_events ORDER BY timestamp DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
