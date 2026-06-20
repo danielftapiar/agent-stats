@@ -331,10 +331,13 @@ func TestLoadCommandsGroupsByCommandName(t *testing.T) {
 		t.Fatalf("expected 1 apply_patch session, got %d", data.Rows[0].SessionCount)
 	}
 	rendered := Render(data, "commands")
-	for _, want := range []string{"Command", "Kind", "FCalls", "Sessions", "Directories", "First Seen", "Last Seen"} {
+	for _, want := range []string{"Command", "Kind", "FCalls", "Sessions", "Directories"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected rendered commands table to include %q:\n%s", want, rendered)
 		}
+	}
+	if strings.Contains(rendered, "First Seen") || strings.Contains(rendered, "Last Seen") {
+		t.Fatalf("expected rendered commands table to omit first/last seen columns:\n%s", rendered)
 	}
 }
 
@@ -357,6 +360,7 @@ func TestLoadPayloadSummariesAndSessionInteractions(t *testing.T) {
 	payloads := []store.PayloadEvent{
 		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", TopLevelType: "event_msg", PayloadType: "agent_message", Phase: "commentary", PayloadBytes: 100},
 		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:00Z", TopLevelType: "response_item", PayloadType: "function_call", CommandName: "exec_command", NormalizedCommand: "sed", PayloadBytes: 200},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:30Z", TopLevelType: "response_item", PayloadType: "message", Role: "assistant", PayloadBytes: 150, InputTextCount: 1, InputTextBytes: 44},
 		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:02:00Z", TopLevelType: "event_msg", PayloadType: "token_count", PayloadBytes: 300, InputTokens: 10, CachedInputTokens: 5, OutputTokens: 4, ReasoningOutputTokens: 1, TotalTokens: 14},
 	}
 	if err := db.SaveFileSyncWithDetails(ctx, source, nil, nil, payloads); err != nil {
@@ -367,12 +371,18 @@ func TestLoadPayloadSummariesAndSessionInteractions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(global.Rows) != 3 {
-		t.Fatalf("expected 3 payload groups, got %d", len(global.Rows))
+	if len(global.Rows) != 4 {
+		t.Fatalf("expected 4 payload groups, got %d", len(global.Rows))
+	}
+	if global.Rows[0].Count < global.Rows[len(global.Rows)-1].Count {
+		t.Fatalf("expected payload groups ordered by count desc: %#v", global.Rows)
 	}
 	renderedGlobal := Render(global, "payload")
 	if !strings.Contains(renderedGlobal, "Payload groups") || !strings.Contains(renderedGlobal, "Payload Bytes") {
 		t.Fatalf("expected global payload summary table:\n%s", renderedGlobal)
+	}
+	if strings.Contains(renderedGlobal, "Last Seen") {
+		t.Fatalf("expected global payload table to omit Last Seen:\n%s", renderedGlobal)
 	}
 
 	session, err := LoadSessionPayload(ctx, db, "session-a", 20)
@@ -386,9 +396,19 @@ func TestLoadPayloadSummariesAndSessionInteractions(t *testing.T) {
 		t.Fatalf("expected interaction total tokens 14, got %d", session.Rows[0].Totals.TotalTokens)
 	}
 	renderedSession := Render(session, "payload")
-	for _, want := range []string{"Session: session-a", "most used command", "Interaction", "Payload Bytes"} {
+	for _, want := range []string{"Session: session-a", "top command", "input_text", "role count", "Interaction", "Payload Bytes"} {
 		if !strings.Contains(renderedSession, want) {
 			t.Fatalf("expected session payload drilldown to contain %q:\n%s", want, renderedSession)
+		}
+	}
+	interaction, err := LoadPayloadInteraction(ctx, db, "session-a", "2026-06-20T10:02:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderedInteraction := Render(interaction, "payload")
+	for _, want := range []string{"Interaction: 2026-06-20T10:02", "interaction payload", "event_msg count", "input_text", "top command", "role count"} {
+		if !strings.Contains(renderedInteraction, want) {
+			t.Fatalf("expected interaction drilldown to contain %q:\n%s", want, renderedInteraction)
 		}
 	}
 }
@@ -414,10 +434,10 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 		t.Fatal("summary table header not found")
 	}
 
-	expectedHeader := []string{"Week", "Credits", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls", "Last Seen"}
+	expectedHeader := []string{"Week", "Credits", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}
 	expectedRows := [][]string{
-		{"2026-W24", "4.2K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K", "2026-06-20T10:00"},
-		{"2026-W23", "0.5", "1.2K", "1K", "200", "16.7%", "12", "2026-06-13T10:00"},
+		{"2026-W24", "4.2K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K"},
+		{"2026-W23", "0.5", "1.2K", "1K", "200", "16.7%", "12"},
 	}
 	columns := columnsFor(append([][]string{expectedHeader}, expectedRows...))
 	assertTableLineAligned(t, lines[headerIndex], columns, expectedHeader)

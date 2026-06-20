@@ -48,6 +48,7 @@ type Row struct {
 type Data struct {
 	View          string `json:"view"`
 	Session       string `json:"session,omitempty"`
+	Interaction   string `json:"interaction,omitempty"`
 	SelectedIndex int    `json:"selected_index,omitempty"`
 	Summary       []Row  `json:"summary,omitempty"`
 	Totals        Totals `json:"totals"`
@@ -119,6 +120,14 @@ func LoadSessionPayload(ctx context.Context, db *store.DB, sessionID string, lim
 	return data, nil
 }
 
+func LoadPayloadInteraction(ctx context.Context, db *store.DB, sessionID, interaction string) (Data, error) {
+	summary, err := queryInteractionSummary(ctx, db, sessionID, interaction)
+	if err != nil {
+		return Data{}, err
+	}
+	return Data{View: "payload", Session: sessionID, Interaction: interaction, SelectedIndex: -1, Summary: summary}, nil
+}
+
 const creditExpr = `(token_events.input_tokens * COALESCE(rate.input_credits_per_million, fallback.input_credits_per_million) +
 	token_events.cached_input_tokens * COALESCE(rate.cached_input_credits_per_million, fallback.cached_input_credits_per_million) +
 	token_events.output_tokens * COALESCE(rate.output_credits_per_million, fallback.output_credits_per_million) +
@@ -135,8 +144,7 @@ func queryWeeklySummary(ctx context.Context, db *store.DB) ([]Row, error) {
 			SUM(output_tokens) AS output_tokens,
 			SUM(reasoning_output_tokens) AS reasoning_output_tokens,
 			SUM(total_tokens) AS total_tokens,
-			SUM(` + creditExpr + `) AS credits,
-			MAX(timestamp) AS last_seen
+			SUM(` + creditExpr + `) AS credits
 		FROM token_events` + creditJoins + `
 		GROUP BY label
 	),
@@ -152,8 +160,7 @@ func queryWeeklySummary(ctx context.Context, db *store.DB) ([]Row, error) {
 		weekly_tokens.reasoning_output_tokens,
 		weekly_tokens.total_tokens,
 		weekly_tokens.credits,
-		COALESCE(weekly_calls.function_calls, 0),
-		weekly_tokens.last_seen
+		COALESCE(weekly_calls.function_calls, 0)
 	FROM weekly_tokens
 	LEFT JOIN weekly_calls ON weekly_calls.label = weekly_tokens.label
 	ORDER BY weekly_tokens.label DESC`
@@ -174,7 +181,6 @@ func queryWeeklySummary(ctx context.Context, db *store.DB) ([]Row, error) {
 			&row.Totals.TotalTokens,
 			&row.Totals.Credits,
 			&row.FunctionCalls,
-			&row.LastSeen,
 		); err != nil {
 			return nil, err
 		}
@@ -193,12 +199,10 @@ func queryPayloadSummary(ctx context.Context, db *store.DB, limit int) ([]Row, e
 		MAX(payload_bytes),
 		CAST(AVG(duration_ms) AS INTEGER),
 		MAX(duration_ms),
-		CAST(AVG(time_to_first_token_ms) AS INTEGER),
-		MIN(timestamp),
-		MAX(timestamp)
+		CAST(AVG(time_to_first_token_ms) AS INTEGER)
 		FROM payload_events
 		GROUP BY top_level_type, payload_type, phase
-		ORDER BY MAX(timestamp) DESC`
+		ORDER BY COUNT(*) DESC, MAX(timestamp) DESC`
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -210,7 +214,7 @@ func queryPayloadSummary(ctx context.Context, db *store.DB, limit int) ([]Row, e
 	var rows []Row
 	for sqlRows.Next() {
 		var row Row
-		if err := sqlRows.Scan(&row.Label, &row.Phase, &row.Count, &row.PayloadBytes, &row.AvgBytes, &row.MaxBytes, &row.AvgDurationMS, &row.MaxDurationMS, &row.AvgTTFTMS, &row.FirstSeen, &row.LastSeen); err != nil {
+		if err := sqlRows.Scan(&row.Label, &row.Phase, &row.Count, &row.PayloadBytes, &row.AvgBytes, &row.MaxBytes, &row.AvgDurationMS, &row.MaxDurationMS, &row.AvgTTFTMS); err != nil {
 			return nil, err
 		}
 		rows = append(rows, row)
@@ -242,12 +246,168 @@ func querySessionPayloadSummary(ctx context.Context, db *store.DB, sessionID str
 	} else {
 		rows = append(rows, row)
 	}
-	if row, err := singlePayloadMetric(ctx, db, sessionID, "most used command", `SELECT 'most used command', COALESCE(NULLIF(normalized_command, ''), command_name), COUNT(*), 0, 0, 0, 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? AND payload_type = 'function_call' GROUP BY COALESCE(NULLIF(normalized_command, ''), command_name) ORDER BY COUNT(*) DESC LIMIT 1`); err != nil {
+	if row, err := singlePayloadMetric(ctx, db, sessionID, "session_meta bytes", `SELECT 'session_meta bytes', '', COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0), COALESCE(MAX(payload_bytes), 0), 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? AND top_level_type = 'session_meta'`); err != nil {
 		return nil, err
-	} else if row.Label != "" {
+	} else {
 		rows = append(rows, row)
 	}
+	if row, err := singlePayloadMetric(ctx, db, sessionID, "event_msg count", `SELECT 'event_msg count', '', COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0), COALESCE(MAX(payload_bytes), 0), 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? AND top_level_type = 'event_msg'`); err != nil {
+		return nil, err
+	} else {
+		rows = append(rows, row)
+	}
+	if row, err := singlePayloadMetric(ctx, db, sessionID, "input_text", `SELECT 'input_text', '', COALESCE(SUM(input_text_count), 0), COALESCE(SUM(input_text_bytes), 0), COALESCE(CAST(AVG(input_text_bytes) AS INTEGER), 0), COALESCE(MAX(input_text_bytes), 0), 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? AND input_text_count > 0`); err != nil {
+		return nil, err
+	} else {
+		rows = append(rows, row)
+	}
+	commandRows, err := queryTopCommands(ctx, db, sessionID, "", "", 5)
+	if err != nil {
+		return nil, err
+	}
+	rows = append(rows, commandRows...)
+	roleRows, err := queryRoleCounts(ctx, db, sessionID, "", "")
+	if err != nil {
+		return nil, err
+	}
+	rows = append(rows, roleRows...)
 	return rows, nil
+}
+
+func queryTopCommands(ctx context.Context, db *store.DB, sessionID, startAfter, endAt string, limit int) ([]Row, error) {
+	where := "session_id = ? AND payload_type = 'function_call' AND COALESCE(NULLIF(normalized_command, ''), command_name) != ''"
+	args := []any{sessionID}
+	if endAt != "" {
+		where += " AND timestamp <= ?"
+		args = append(args, endAt)
+	}
+	if startAfter != "" {
+		where += " AND timestamp > ?"
+		args = append(args, startAfter)
+	}
+	query := `SELECT 'top command', COALESCE(NULLIF(normalized_command, ''), command_name), COUNT(*), 0, 0, 0, 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '')
+		FROM payload_events
+		WHERE ` + where + `
+		GROUP BY COALESCE(NULLIF(normalized_command, ''), command_name)
+		ORDER BY COUNT(*) DESC, COALESCE(NULLIF(normalized_command, ''), command_name) ASC`
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	sqlRows, err := db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+	var rows []Row
+	for sqlRows.Next() {
+		var row Row
+		if err := sqlRows.Scan(&row.Label, &row.Phase, &row.Count, &row.PayloadBytes, &row.AvgBytes, &row.MaxBytes, &row.AvgDurationMS, &row.MaxDurationMS, &row.AvgTTFTMS, &row.FirstSeen, &row.LastSeen); err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	return rows, sqlRows.Err()
+}
+
+func queryRoleCounts(ctx context.Context, db *store.DB, sessionID, startAfter, endAt string) ([]Row, error) {
+	where := "session_id = ? AND role != ''"
+	args := []any{sessionID}
+	if endAt != "" {
+		where += " AND timestamp <= ?"
+		args = append(args, endAt)
+	}
+	if startAfter != "" {
+		where += " AND timestamp > ?"
+		args = append(args, startAfter)
+	}
+	sqlRows, err := db.Query(ctx, `SELECT 'role count', role, COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0), COALESCE(MAX(payload_bytes), 0), 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '')
+		FROM payload_events
+		WHERE `+where+`
+		GROUP BY role
+		ORDER BY COUNT(*) DESC, role ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+	var rows []Row
+	for sqlRows.Next() {
+		var row Row
+		if err := sqlRows.Scan(&row.Label, &row.Phase, &row.Count, &row.PayloadBytes, &row.AvgBytes, &row.MaxBytes, &row.AvgDurationMS, &row.MaxDurationMS, &row.AvgTTFTMS, &row.FirstSeen, &row.LastSeen); err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	return rows, sqlRows.Err()
+}
+
+func queryInteractionSummary(ctx context.Context, db *store.DB, sessionID, interaction string) ([]Row, error) {
+	previous, err := previousInteraction(ctx, db, sessionID, interaction)
+	if err != nil {
+		return nil, err
+	}
+	where := "session_id = ? AND timestamp <= ?"
+	args := []any{sessionID, interaction}
+	if previous != "" {
+		where += " AND timestamp > ?"
+		args = append(args, previous)
+	}
+	rows := []Row{}
+	if row, err := singlePayloadMetricArgs(ctx, db, "interaction payload", `SELECT 'interaction payload', '', COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0), COALESCE(MAX(payload_bytes), 0), COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0), COALESCE(MAX(duration_ms), 0), COALESCE(CAST(AVG(time_to_first_token_ms) AS INTEGER), 0), COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE `+where, args...); err != nil {
+		return nil, err
+	} else {
+		rows = append(rows, row)
+	}
+	if row, err := singlePayloadMetricArgs(ctx, db, "event_msg count", `SELECT 'event_msg count', '', COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0), COALESCE(MAX(payload_bytes), 0), 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE top_level_type = 'event_msg' AND `+where, args...); err != nil {
+		return nil, err
+	} else {
+		rows = append(rows, row)
+	}
+	if row, err := singlePayloadMetricArgs(ctx, db, "input_text", `SELECT 'input_text', '', COALESCE(SUM(input_text_count), 0), COALESCE(SUM(input_text_bytes), 0), COALESCE(CAST(AVG(input_text_bytes) AS INTEGER), 0), COALESCE(MAX(input_text_bytes), 0), 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE input_text_count > 0 AND `+where, args...); err != nil {
+		return nil, err
+	} else {
+		rows = append(rows, row)
+	}
+	commandRows, err := queryTopCommands(ctx, db, sessionID, previous, interaction, 5)
+	if err != nil {
+		return nil, err
+	}
+	rows = append(rows, commandRows...)
+	roleRows, err := queryRoleCounts(ctx, db, sessionID, previous, interaction)
+	if err != nil {
+		return nil, err
+	}
+	rows = append(rows, roleRows...)
+	return rows, nil
+}
+
+func previousInteraction(ctx context.Context, db *store.DB, sessionID, interaction string) (string, error) {
+	rows, err := db.Query(ctx, `SELECT COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? AND payload_type = 'token_count' AND timestamp < ?`, sessionID, interaction)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var previous string
+	if rows.Next() {
+		if err := rows.Scan(&previous); err != nil {
+			return "", err
+		}
+	}
+	return previous, rows.Err()
+}
+
+func singlePayloadMetricArgs(ctx context.Context, db *store.DB, label, query string, args ...any) (Row, error) {
+	sqlRows, err := db.Query(ctx, query, args...)
+	if err != nil {
+		return Row{}, err
+	}
+	defer sqlRows.Close()
+	row := Row{Label: label}
+	if sqlRows.Next() {
+		if err := sqlRows.Scan(&row.Label, &row.Phase, &row.Count, &row.PayloadBytes, &row.AvgBytes, &row.MaxBytes, &row.AvgDurationMS, &row.MaxDurationMS, &row.AvgTTFTMS, &row.FirstSeen, &row.LastSeen); err != nil {
+			return Row{}, err
+		}
+	}
+	return row, sqlRows.Err()
 }
 
 func singlePayloadMetric(ctx context.Context, db *store.DB, sessionID, label, query string) (Row, error) {
@@ -534,13 +694,16 @@ func Render(data Data, view string) string {
 	}
 	if view == "payload" {
 		writePayloadSummary(&b, data)
+		if data.Interaction != "" {
+			return b.String()
+		}
 		if len(data.Rows) == 0 {
 			b.WriteString("\nNo payload events found.\n")
 			return b.String()
 		}
 		b.WriteString("\n")
 		if data.Session != "" {
-			writePayloadSessionRows(&b, data.Rows)
+			writePayloadSessionRows(&b, data.Rows, data.SelectedIndex)
 		} else {
 			writePayloadRows(&b, data.Rows)
 		}
@@ -582,7 +745,9 @@ func writeWeeklySummary(b *strings.Builder, rows []Row) {
 		calls += row.FunctionCalls
 	}
 	fmt.Fprintf(b, "Weekly credits: %s  Function calls: %s\n\n", formatCredits(credits), formatInt(calls))
-	tableRows := [][]string{{"Week", "Credits", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls", "Last Seen"}}
+	writeCreditsGraph(b, rows)
+	b.WriteString("\n")
+	tableRows := [][]string{{"Week", "Credits", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
 			row.Label,
@@ -592,7 +757,6 @@ func writeWeeklySummary(b *strings.Builder, rows []Row) {
 			formatInt(row.Totals.CacheReadInputTokens),
 			fmt.Sprintf("%.1f%%", row.Totals.CacheHitRate*100),
 			formatInt(row.FunctionCalls),
-			compactTime(row.LastSeen),
 		})
 	}
 	columns := columnsFor(tableRows)
@@ -602,7 +766,7 @@ func writeWeeklySummary(b *strings.Builder, rows []Row) {
 }
 
 func writeCommandRows(b *strings.Builder, rows []Row) {
-	tableRows := [][]string{{"Command", "Kind", "FCalls", "Sessions", "Directories", "First Seen", "Last Seen"}}
+	tableRows := [][]string{{"Command", "Kind", "FCalls", "Sessions", "Directories"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
 			truncate(row.Label, 28),
@@ -610,8 +774,6 @@ func writeCommandRows(b *strings.Builder, rows []Row) {
 			formatInt(row.FunctionCalls),
 			formatInt(row.SessionCount),
 			row.Directory,
-			compactTime(row.FirstSeen),
-			compactTime(row.LastSeen),
 		})
 	}
 	columns := columnsFor(tableRows)
@@ -631,10 +793,13 @@ func writePayloadSummary(b *strings.Builder, data Data) {
 		return
 	}
 	fmt.Fprintf(b, "Session: %s\n", data.Session)
+	if data.Interaction != "" {
+		fmt.Fprintf(b, "Interaction: %s\n", compactTime(data.Interaction))
+	}
 	if len(data.Summary) == 0 {
 		return
 	}
-	tableRows := [][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT", "First Seen", "Last Seen"}}
+	tableRows := [][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT"}}
 	for _, row := range data.Summary {
 		tableRows = append(tableRows, []string{
 			truncate(row.Label, 26),
@@ -646,8 +811,6 @@ func writePayloadSummary(b *strings.Builder, data Data) {
 			formatDuration(row.AvgDurationMS),
 			formatDuration(row.MaxDurationMS),
 			formatDuration(row.AvgTTFTMS),
-			compactTime(row.FirstSeen),
-			compactTime(row.LastSeen),
 		})
 	}
 	columns := columnsFor(tableRows)
@@ -657,7 +820,7 @@ func writePayloadSummary(b *strings.Builder, data Data) {
 }
 
 func writePayloadRows(b *strings.Builder, rows []Row) {
-	tableRows := [][]string{{"Payload", "Phase", "Count", "Payload Bytes", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT", "Last Seen"}}
+	tableRows := [][]string{{"Payload", "Phase", "Count", "Payload Bytes", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
 			truncate(row.Label, 30),
@@ -669,7 +832,6 @@ func writePayloadRows(b *strings.Builder, rows []Row) {
 			formatDuration(row.AvgDurationMS),
 			formatDuration(row.MaxDurationMS),
 			formatDuration(row.AvgTTFTMS),
-			compactTime(row.LastSeen),
 		})
 	}
 	columns := columnsFor(tableRows)
@@ -678,11 +840,15 @@ func writePayloadRows(b *strings.Builder, rows []Row) {
 	}
 }
 
-func writePayloadSessionRows(b *strings.Builder, rows []Row) {
+func writePayloadSessionRows(b *strings.Builder, rows []Row, selectedIndex int) {
 	tableRows := [][]string{{"Interaction", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Payload Bytes", "Dur", "TTFT", "Hit Rate"}}
-	for _, row := range rows {
+	for i, row := range rows {
+		label := compactTime(row.Label)
+		if i == selectedIndex {
+			label = "> " + label
+		}
 		tableRows = append(tableRows, []string{
-			compactTime(row.Label),
+			label,
 			formatInt(row.Totals.TotalTokens),
 			formatInt(row.Totals.UncachedInputTokens),
 			formatInt(row.Totals.CacheReadInputTokens),
@@ -818,8 +984,6 @@ func tableColumnFor(header string) tableColumn {
 		return tableColumn{width: 12, align: alignCenter}
 	case "Sessions":
 		return tableColumn{width: 10, align: alignCenter}
-	case "First Seen", "Last Seen":
-		return tableColumn{width: 16, align: alignCenter}
 	case "Count", "FCalls":
 		return tableColumn{width: 8, align: alignCenter}
 	case "Credits":
@@ -889,6 +1053,24 @@ func writeGraph(b *strings.Builder, rows []Row, view string) {
 		return
 	}
 	b.WriteString(asciigraph.Plot(values, asciigraph.Height(8), asciigraph.YAxisValueFormatter(graphValueFormatter(view))))
+	b.WriteString("\n")
+}
+
+func writeCreditsGraph(b *strings.Builder, rows []Row) {
+	if len(rows) == 0 {
+		return
+	}
+	values := make([]float64, 0, len(rows))
+	labels := make([]string, 0, len(rows))
+	for i := len(rows) - 1; i >= 0; i-- {
+		values = append(values, rows[i].Totals.Credits)
+		labels = append(labels, rows[i].Label)
+	}
+	b.WriteString(asciigraph.Plot(values, asciigraph.Height(8), asciigraph.YAxisValueFormatter(func(value float64) string {
+		return formatCredits(value)
+	})))
+	b.WriteString("\nWeeks: ")
+	b.WriteString(strings.Join(labels, " "))
 	b.WriteString("\n")
 }
 
