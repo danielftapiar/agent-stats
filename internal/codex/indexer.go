@@ -85,6 +85,13 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 	}
 	size := info.Size()
 	modTime := info.ModTime().Unix()
+	if found && meta.ProcessedOffset > 0 && usageFromSourceFile(meta).isZero() {
+		if err := i.db.DeleteSourceFileEvents(ctx, path); err != nil {
+			return err
+		}
+		meta = store.SourceFile{}
+		found = false
+	}
 	if found && meta.SizeBytes == size && meta.ModTimeUnix == modTime {
 		return nil
 	}
@@ -92,7 +99,7 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		if err := i.db.DeleteSourceFileEvents(ctx, path); err != nil {
 			return err
 		}
-		meta.ProcessedOffset = 0
+		meta = store.SourceFile{}
 	}
 
 	file, err := os.Open(path)
@@ -107,7 +114,7 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		}
 	}
 
-	events, offset, err := ParseFile(file, path, sessionID, meta.ProcessedOffset)
+	events, offset, checkpoint, err := ParseFile(file, path, sessionID, meta.ProcessedOffset, usageFromSourceFile(meta))
 	if err != nil {
 		return err
 	}
@@ -121,6 +128,7 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		ProcessedOffset: offset,
 		SessionID:       sessionID,
 	}
+	applyCheckpoint(&source, checkpoint)
 	if len(events) > 0 {
 		source.StartedAt = events[0].Timestamp
 		source.LastSeenAt = events[len(events)-1].Timestamp
@@ -161,13 +169,13 @@ type rawUsage struct {
 	TotalTokens           int64 `json:"total_tokens"`
 }
 
-func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64) ([]store.TokenEvent, int64, error) {
+func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, initialPrevious rawUsage) ([]store.TokenEvent, int64, rawUsage, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
 
 	var events []store.TokenEvent
-	var previous rawUsage
-	var hasPrevious bool
+	previous := initialPrevious
+	hasPrevious := !previous.isZero()
 	offset := startOffset
 
 	for scanner.Scan() {
@@ -185,8 +193,12 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64) ([]
 			continue
 		}
 
+		current := normalizeTotal(raw.Payload.Info.TotalTokenUsage)
+		if hasPrevious && current.equal(previous) {
+			continue
+		}
 		usage, ok := eventUsage(raw.Payload.Info, previous, hasPrevious)
-		previous = raw.Payload.Info.TotalTokenUsage
+		previous = current
 		hasPrevious = true
 		if !ok || usage.TotalTokens <= 0 {
 			continue
@@ -206,11 +218,11 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64) ([]
 	}
 	if err := scanner.Err(); err != nil {
 		if errors.Is(err, bufio.ErrFinalToken) {
-			return events, offset, nil
+			return events, offset, previous, nil
 		}
-		return nil, offset, err
+		return nil, offset, previous, err
 	}
-	return events, offset, nil
+	return events, offset, previous, nil
 }
 
 func eventUsage(info *rawInfo, previous rawUsage, hasPrevious bool) (rawUsage, bool) {
@@ -242,4 +254,38 @@ func normalizeTotal(usage rawUsage) rawUsage {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
 	return usage
+}
+
+func (usage rawUsage) equal(other rawUsage) bool {
+	return usage.InputTokens == other.InputTokens &&
+		usage.CachedInputTokens == other.CachedInputTokens &&
+		usage.OutputTokens == other.OutputTokens &&
+		usage.ReasoningOutputTokens == other.ReasoningOutputTokens &&
+		usage.TotalTokens == other.TotalTokens
+}
+
+func (usage rawUsage) isZero() bool {
+	return usage.InputTokens == 0 &&
+		usage.CachedInputTokens == 0 &&
+		usage.OutputTokens == 0 &&
+		usage.ReasoningOutputTokens == 0 &&
+		usage.TotalTokens == 0
+}
+
+func usageFromSourceFile(source store.SourceFile) rawUsage {
+	return rawUsage{
+		InputTokens:           source.LastTotalInputTokens,
+		CachedInputTokens:     source.LastTotalCachedInputTokens,
+		OutputTokens:          source.LastTotalOutputTokens,
+		ReasoningOutputTokens: source.LastTotalReasoningTokens,
+		TotalTokens:           source.LastTotalTokens,
+	}
+}
+
+func applyCheckpoint(source *store.SourceFile, usage rawUsage) {
+	source.LastTotalInputTokens = usage.InputTokens
+	source.LastTotalCachedInputTokens = usage.CachedInputTokens
+	source.LastTotalOutputTokens = usage.OutputTokens
+	source.LastTotalReasoningTokens = usage.ReasoningOutputTokens
+	source.LastTotalTokens = usage.TotalTokens
 }

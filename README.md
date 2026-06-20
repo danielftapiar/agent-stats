@@ -22,7 +22,7 @@ Codex emits `token_count` events with cumulative totals similar to:
 }
 ```
 
-Because the values are cumulative within a session, `agent-stats` should calculate usage by taking the delta between consecutive `token_count` events instead of summing every event directly.
+Because the values are cumulative within a session, `agent-stats` should calculate usage by taking the delta between consecutive `token_count` events instead of summing every event directly. Repeated `token_count` events with the same cumulative totals should be skipped so resumed or duplicated Codex events do not double-count usage.
 
 ## Features
 
@@ -35,11 +35,13 @@ Because the values are cumulative within a session, `agent-stats` should calcula
   - output tokens
   - reasoning output tokens
   - total tokens
-- Calculate cache hit rate:
+- Calculate prompt cache hit rate:
 
 ```text
-cache_hit_rate = cached_input_tokens / (cached_input_tokens + input_tokens)
+hit_rate = cache_read / (cache_read + cache_creation + uncached_input)
 ```
+
+For local Codex logs, `cached_input_tokens` is treated as `cache_read`, `input_tokens` is treated as `uncached_input`, and `cache_creation` is currently `0` because Codex rollouts do not expose a separate cache creation field.
 
 - Render a fast terminal graph UI for quick inspection.
 - Support a quiet machine-readable mode for scripts.
@@ -247,7 +249,7 @@ For each session:
 
 This avoids double-counting because Codex records running totals rather than independent per-event usage.
 
-Recent Codex logs may also include `info.last_token_usage`. When present, prefer `last_token_usage` because it already represents the per-event increment. Fall back to the cumulative delta method when `last_token_usage` is missing.
+Recent Codex logs may also include `info.last_token_usage`. When present, prefer `last_token_usage` because it already represents the per-event increment. Fall back to the cumulative delta method when `last_token_usage` is missing. In both cases, dedupe by comparing the cumulative `total_token_usage` checkpoint before counting an event.
 
 ## Data Storage and Loading
 
@@ -283,7 +285,12 @@ CREATE TABLE source_files (
   processed_offset INTEGER NOT NULL,
   session_id TEXT NOT NULL,
   started_at TEXT,
-  last_seen_at TEXT
+  last_seen_at TEXT,
+  last_total_input_tokens INTEGER NOT NULL DEFAULT 0,
+  last_total_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  last_total_output_tokens INTEGER NOT NULL DEFAULT 0,
+  last_total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  last_total_tokens INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE token_events (
@@ -340,7 +347,7 @@ Implementation notes that changed or clarified the initial plan:
 - The default cache path uses Go's `os.UserCacheDir()`. On macOS this resolves under `~/Library/Caches/agent-stats/` instead of the originally documented `~/.cache/agent-stats/`.
 - The module currently targets Go 1.25 because that is the local toolchain used to resolve and verify dependencies.
 - Current Codex logs include `payload.info.last_token_usage`, so the implementation prefers that over cumulative delta calculation. Cumulative delta fallback is still implemented for older log shapes.
-- Incremental byte-offset parsing is reliable for current logs with `last_token_usage`. For older cumulative-only logs, a changed file may need full reprocessing to avoid losing the previous cumulative baseline.
+- Incremental byte-offset parsing stores the last cumulative `total_token_usage` checkpoint per file so appended Codex events can be deduped safely across restarts.
 - The pre-hook uses `go fmt ./...` instead of `gofmt -w .` so it does not traverse local build/module caches or unrelated hidden directories.
 - The first implementation uses polling for active files rather than filesystem notifications. This keeps the dependency surface smaller and is fast enough for the current data volume.
 - The non-interactive `graph` command currently maps to the `daily` graph view. A dedicated `--since` filter still needs to be added.

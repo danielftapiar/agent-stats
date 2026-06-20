@@ -64,6 +64,12 @@ func TestLoadDailyAggregatesTokenEvents(t *testing.T) {
 	if data.Rows[0].Totals.CacheHitRate != float64(60)/float64(90) {
 		t.Fatalf("unexpected cache hit rate %f", data.Rows[0].Totals.CacheHitRate)
 	}
+	if data.Rows[0].Totals.UncachedInputTokens != 30 {
+		t.Fatalf("expected uncached input tokens 30, got %d", data.Rows[0].Totals.UncachedInputTokens)
+	}
+	if data.Rows[0].Totals.CacheReadInputTokens != 60 {
+		t.Fatalf("expected cache read tokens 60, got %d", data.Rows[0].Totals.CacheReadInputTokens)
+	}
 }
 
 func TestLoadSummaryDoesNotDoubleCountTokenTypeRows(t *testing.T) {
@@ -120,8 +126,9 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 			CacheHitRate:          0.9787,
 		},
 		Rows: []Row{
-			{Label: "input", Totals: Totals{TotalTokens: 1733772383, InputTokens: 1733772383}},
-			{Label: "cached input", Totals: Totals{TotalTokens: 1656928512, CachedInputTokens: 1656928512}},
+			{Label: "uncached input", Totals: withDerived(Totals{TotalTokens: 1733772383, InputTokens: 1733772383})},
+			{Label: "cache read", Totals: withDerived(Totals{TotalTokens: 1656928512, CachedInputTokens: 1656928512})},
+			{Label: "cache creation", Totals: withDerived(Totals{})},
 			{Label: "output", Totals: Totals{TotalTokens: 5163766, OutputTokens: 5163766}},
 			{Label: "reasoning output", Totals: Totals{TotalTokens: 1770977, ReasoningOutputTokens: 1770977}},
 		},
@@ -139,10 +146,11 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 		t.Fatal("summary table header not found")
 	}
 
-	expectedHeader := []string{"Group", "Total", "Input", "Cached", "Output", "Reasoning", "Cache"}
+	expectedHeader := []string{"Group", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Hit Rate"}
 	expectedRows := [][]string{
-		{"input", "1.73B", "1.73B", "0", "0", "0", "0.0%"},
-		{"cached input", "1.66B", "0", "1.66B", "0", "0", "0.0%"},
+		{"uncached input", "1.73B", "1.73B", "0", "0", "0", "0.0%"},
+		{"cache read", "1.66B", "0", "1.66B", "0", "0", "100.0%"},
+		{"cache creation", "0", "0", "0", "0", "0", "0.0%"},
 		{"output", "5.16M", "0", "0", "5.16M", "0", "0.0%"},
 		{"reasoning output", "1.77M", "0", "0", "0", "1.77M", "0.0%"},
 	}
@@ -154,6 +162,20 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 			t.Fatalf("missing table row %d", i)
 		}
 		assertTableLineAligned(t, lines[lineIndex], columns, expected)
+	}
+}
+
+func TestCacheHitRateUsesArticleFormula(t *testing.T) {
+	totals := Totals{
+		UncachedInputTokens:      25,
+		CacheReadInputTokens:     70,
+		CacheCreationInputTokens: 5,
+	}
+
+	got := cacheHitRate(totals)
+	want := 0.7
+	if got != want {
+		t.Fatalf("expected hit rate cache_read/(cache_read+cache_creation+uncached_input) = %f, got %f", want, got)
 	}
 }
 
