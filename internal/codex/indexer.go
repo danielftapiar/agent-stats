@@ -20,6 +20,8 @@ type Indexer struct {
 	sessionsDir string
 }
 
+const payloadMetricsVersion = 1
+
 func NewIndexer(db *store.DB, sessionsDir string) *Indexer {
 	return &Indexer{db: db, sessionsDir: sessionsDir}
 }
@@ -107,6 +109,13 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		meta = store.SourceFile{}
 		found = false
 	}
+	if found && meta.PayloadMetricsVersion < payloadMetricsVersion {
+		if err := i.db.DeleteSourceFileEvents(ctx, path); err != nil {
+			return err
+		}
+		meta = store.SourceFile{}
+		found = false
+	}
 	if found {
 		hasPayloads, err := i.db.HasPayloadEvents(ctx, path)
 		if err != nil {
@@ -151,14 +160,15 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		result.Offset = size
 	}
 	source := store.SourceFile{
-		Path:              path,
-		SizeBytes:         size,
-		ModTimeUnix:       modTime,
-		ProcessedOffset:   result.Offset,
-		SessionID:         sessionID,
-		SessionDir:        result.SessionDir,
-		Model:             result.Model,
-		FunctionCallCount: int64(len(result.Commands)),
+		Path:                  path,
+		SizeBytes:             size,
+		ModTimeUnix:           modTime,
+		ProcessedOffset:       result.Offset,
+		SessionID:             sessionID,
+		SessionDir:            result.SessionDir,
+		Model:                 result.Model,
+		FunctionCallCount:     int64(len(result.Commands)),
+		PayloadMetricsVersion: payloadMetricsVersion,
 	}
 	if found {
 		if source.SessionDir == "" {
@@ -202,11 +212,19 @@ type rawPayload struct {
 	Name               string          `json:"name"`
 	Namespace          string          `json:"namespace"`
 	Arguments          string          `json:"arguments"`
+	Output             string          `json:"output"`
+	Role               string          `json:"role"`
+	Content            []rawContent    `json:"content"`
 	Phase              string          `json:"phase"`
 	CompletedAt        string          `json:"completed_at"`
 	DurationMS         json.RawMessage `json:"duration_ms"`
 	TimeToFirstTokenMS json.RawMessage `json:"time_to_first_token_ms"`
 	CallID             string          `json:"call_id"`
+}
+
+type rawContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 type rawInfo struct {
@@ -270,7 +288,11 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 			TopLevelType:       raw.Type,
 			PayloadType:        payload.Type,
 			Phase:              payload.Phase,
-			PayloadBytes:       int64(len(raw.Payload)),
+			PayloadBytes:       payloadByteSize(raw.Payload, payload),
+			ContentBytes:       payloadContentBytes(payload),
+			Role:               payload.Role,
+			InputTextCount:     payloadInputTextCount(payload),
+			InputTextBytes:     payloadInputTextBytes(payload),
 			CompletedAt:        payload.CompletedAt,
 			DurationMS:         rawInt64(payload.DurationMS),
 			TimeToFirstTokenMS: rawInt64(payload.TimeToFirstTokenMS),
@@ -382,6 +404,43 @@ func rawInt64(raw json.RawMessage) int64 {
 		}
 	}
 	return 0
+}
+
+func payloadByteSize(raw json.RawMessage, payload rawPayload) int64 {
+	return int64(len(raw)) + payloadContentBytes(payload)
+}
+
+func payloadContentBytes(payload rawPayload) int64 {
+	var total int64
+	if payload.Output != "" {
+		total += int64(len(payload.Output))
+	}
+	for _, content := range payload.Content {
+		if content.Text != "" {
+			total += int64(len(content.Text))
+		}
+	}
+	return total
+}
+
+func payloadInputTextCount(payload rawPayload) int64 {
+	var count int64
+	for _, content := range payload.Content {
+		if content.Type == "input_text" {
+			count++
+		}
+	}
+	return count
+}
+
+func payloadInputTextBytes(payload rawPayload) int64 {
+	var total int64
+	for _, content := range payload.Content {
+		if content.Type == "input_text" {
+			total += int64(len(content.Text))
+		}
+	}
+	return total
 }
 
 func normalizedPayloadCommand(payload rawPayload) string {

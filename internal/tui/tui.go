@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -31,25 +32,27 @@ var viewNames = []string{
 }
 
 type model struct {
-	ctx      context.Context
-	db       *store.DB
-	indexer  *codex.Indexer
-	active   int
-	input    textinput.Model
-	viewport viewport.Model
-	prompt   bool
-	picker   bool
-	err      string
-	data     views.Data
-	width    int
-	height   int
-	lastSync time.Time
-	theme    theme
-	themes   []namedTheme
-	selected int
-	preview  int
-	row      int
-	session  string
+	ctx         context.Context
+	db          *store.DB
+	indexer     *codex.Indexer
+	active      int
+	input       textinput.Model
+	viewport    viewport.Model
+	prompt      bool
+	picker      bool
+	err         string
+	data        views.Data
+	width       int
+	height      int
+	lastSync    time.Time
+	theme       theme
+	themes      []namedTheme
+	selected    int
+	preview     int
+	row         int
+	payloadRow  int
+	session     string
+	interaction string
 }
 
 func Run(ctx context.Context, db *store.DB, indexer *codex.Indexer) error {
@@ -138,12 +141,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.reload()
 				return m, nil
 			}
+			if m.inSessionPayload() && len(m.data.Rows) > 0 {
+				m.clampPayloadRow()
+				m.interaction = m.data.Rows[m.payloadRow].Label
+				m.reload()
+				return m, nil
+			}
+		case "esc", "backspace":
+			if viewNames[m.active] == "payload" && m.interaction != "" {
+				m.interaction = ""
+				m.reload()
+				return m, nil
+			}
+		case "d":
+			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
+				m.deleteSelectedSession()
+				return m, nil
+			}
 		case "j", "down":
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
 				m.row++
 				if m.row >= len(m.data.Rows) {
 					m.row = len(m.data.Rows) - 1
 				}
+				m.setViewportContent()
+				return m, nil
+			}
+			if m.inSessionPayload() && len(m.data.Rows) > 0 {
+				m.payloadRow++
+				m.clampPayloadRow()
 				m.setViewportContent()
 				return m, nil
 			}
@@ -156,9 +182,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setViewportContent()
 				return m, nil
 			}
+			if m.inSessionPayload() && len(m.data.Rows) > 0 {
+				m.payloadRow--
+				m.clampPayloadRow()
+				m.setViewportContent()
+				return m, nil
+			}
 		case "tab":
 			m.active = (m.active + 1) % len(viewNames)
 			m.session = ""
+			m.interaction = ""
 			m.reload()
 			return m, nil
 		case "shift+tab":
@@ -167,6 +200,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.active = len(viewNames) - 1
 			}
 			m.session = ""
+			m.interaction = ""
 			m.reload()
 			return m, nil
 		}
@@ -177,6 +211,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if next < len(viewNames) {
 					m.active = next
 					m.session = ""
+					m.interaction = ""
 					m.reload()
 				}
 			}
@@ -214,6 +249,7 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.active = idx
 			if value != "payload" {
 				m.session = ""
+				m.interaction = ""
 			}
 			m.err = ""
 			m.reload()
@@ -271,7 +307,11 @@ func (m *model) reload() {
 		err  error
 	)
 	if viewNames[m.active] == "payload" && m.session != "" {
-		data, err = views.LoadSessionPayload(m.ctx, m.db, m.session, 20)
+		if m.interaction != "" {
+			data, err = views.LoadPayloadInteraction(m.ctx, m.db, m.session, m.interaction)
+		} else {
+			data, err = views.LoadSessionPayload(m.ctx, m.db, m.session, 20)
+		}
 	} else {
 		data, err = views.Load(m.ctx, m.db, viewNames[m.active], 20, time.Now())
 	}
@@ -287,6 +327,15 @@ func (m *model) reload() {
 			m.row = 0
 		}
 		data.SelectedIndex = m.row
+	}
+	if m.inSessionPayload() && m.interaction == "" {
+		if m.payloadRow >= len(data.Rows) {
+			m.payloadRow = len(data.Rows) - 1
+		}
+		if m.payloadRow < 0 {
+			m.payloadRow = 0
+		}
+		data.SelectedIndex = m.payloadRow
 	}
 	m.data = data
 	m.setViewportContent()
@@ -344,6 +393,9 @@ func (m model) renderContent() string {
 	if viewNames[m.active] == "sessions" {
 		m.data.SelectedIndex = m.row
 	}
+	if m.inSessionPayload() && m.interaction == "" {
+		m.data.SelectedIndex = m.payloadRow
+	}
 	return m.themeContent(views.Render(m.data, viewNames[m.active]))
 }
 
@@ -357,13 +409,73 @@ func (m model) themeContent(content string) string {
 			lines[i] = m.theme.ViewTitle.Render(line)
 		case strings.HasPrefix(line, "Total:"):
 			lines[i] = m.theme.Totals.Render(line)
-		case strings.HasPrefix(line, "Group"):
+		case isTableHeader(line):
 			lines[i] = m.theme.TableHeader.Render(line)
+		case isSelectedLine(line):
+			lines[i] = m.theme.ActiveTab.Width(lipgloss.Width(line)).Render(line)
 		case strings.ContainsAny(line, "┤┼╭╮╯╰─│"):
 			lines[i] = m.theme.Graph.Render(line)
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m model) inSessionPayload() bool {
+	return viewNames[m.active] == "payload" && m.session != ""
+}
+
+func (m *model) clampPayloadRow() {
+	if m.payloadRow >= len(m.data.Rows) {
+		m.payloadRow = len(m.data.Rows) - 1
+	}
+	if m.payloadRow < 0 {
+		m.payloadRow = 0
+	}
+}
+
+func (m *model) deleteSelectedSession() {
+	if len(m.data.Rows) == 0 {
+		return
+	}
+	if m.row < 0 {
+		m.row = 0
+	}
+	if m.row >= len(m.data.Rows) {
+		m.row = len(m.data.Rows) - 1
+	}
+	sessionID := strings.TrimPrefix(m.data.Rows[m.row].Label, "> ")
+	paths, err := m.db.SessionSourcePaths(m.ctx, sessionID)
+	if err != nil {
+		m.err = err.Error()
+		return
+	}
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			m.err = err.Error()
+			return
+		}
+	}
+	if err := m.db.DeleteSession(m.ctx, sessionID); err != nil {
+		m.err = err.Error()
+		return
+	}
+	m.err = fmt.Sprintf("deleted session %s", sessionID)
+	m.session = ""
+	m.interaction = ""
+	m.reload()
+}
+
+func isTableHeader(line string) bool {
+	for _, prefix := range []string{"Group", "Week", "Command", "Payload", "Metric", "Interaction"} {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSelectedLine(line string) bool {
+	return strings.HasPrefix(strings.TrimLeft(line, " "), "> ")
 }
 
 func (m model) renderThemePicker() string {

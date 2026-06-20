@@ -23,6 +23,7 @@ type SourceFile struct {
 	SessionDir                 string
 	Model                      string
 	FunctionCallCount          int64
+	PayloadMetricsVersion      int64
 	StartedAt                  string
 	LastSeenAt                 string
 	LastTotalInputTokens       int64
@@ -65,6 +66,10 @@ type PayloadEvent struct {
 	PayloadType           string `json:"payload_type"`
 	Phase                 string `json:"phase,omitempty"`
 	PayloadBytes          int64  `json:"payload_bytes"`
+	ContentBytes          int64  `json:"content_bytes,omitempty"`
+	Role                  string `json:"role,omitempty"`
+	InputTextCount        int64  `json:"input_text_count,omitempty"`
+	InputTextBytes        int64  `json:"input_text_bytes,omitempty"`
 	CompletedAt           string `json:"completed_at,omitempty"`
 	DurationMS            int64  `json:"duration_ms,omitempty"`
 	TimeToFirstTokenMS    int64  `json:"time_to_first_token_ms,omitempty"`
@@ -125,6 +130,7 @@ func (db *DB) migrate(ctx context.Context) error {
 			session_dir TEXT NOT NULL DEFAULT '',
 			model TEXT NOT NULL DEFAULT '',
 			function_call_count INTEGER NOT NULL DEFAULT 0,
+			payload_metrics_version INTEGER NOT NULL DEFAULT 0,
 			started_at TEXT,
 			last_seen_at TEXT,
 			last_total_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -141,6 +147,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		`ALTER TABLE source_files ADD COLUMN session_dir TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE source_files ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE source_files ADD COLUMN function_call_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE source_files ADD COLUMN payload_metrics_version INTEGER NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS token_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,
@@ -180,6 +187,10 @@ func (db *DB) migrate(ctx context.Context) error {
 			payload_type TEXT NOT NULL,
 			phase TEXT NOT NULL DEFAULT '',
 			payload_bytes INTEGER NOT NULL,
+			content_bytes INTEGER NOT NULL DEFAULT 0,
+			role TEXT NOT NULL DEFAULT '',
+			input_text_count INTEGER NOT NULL DEFAULT 0,
+			input_text_bytes INTEGER NOT NULL DEFAULT 0,
 			completed_at TEXT NOT NULL DEFAULT '',
 			duration_ms INTEGER NOT NULL DEFAULT 0,
 			time_to_first_token_ms INTEGER NOT NULL DEFAULT 0,
@@ -197,6 +208,10 @@ func (db *DB) migrate(ctx context.Context) error {
 			raw_json TEXT NOT NULL DEFAULT ''
 		)`,
 		`ALTER TABLE payload_events ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE payload_events ADD COLUMN content_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE payload_events ADD COLUMN role TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE payload_events ADD COLUMN input_text_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE payload_events ADD COLUMN input_text_bytes INTEGER NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS payload_events_timestamp_idx ON payload_events(timestamp)`,
 		`CREATE INDEX IF NOT EXISTS payload_events_session_idx ON payload_events(session_id)`,
 		`CREATE INDEX IF NOT EXISTS payload_events_source_path_idx ON payload_events(source_path)`,
@@ -239,6 +254,7 @@ func (db *DB) SourceFile(ctx context.Context, path string) (SourceFile, bool, er
 		session_dir,
 		model,
 		function_call_count,
+		payload_metrics_version,
 		COALESCE(started_at, ''),
 		COALESCE(last_seen_at, ''),
 		last_total_input_tokens,
@@ -257,6 +273,7 @@ func (db *DB) SourceFile(ctx context.Context, path string) (SourceFile, bool, er
 		&sf.SessionDir,
 		&sf.Model,
 		&sf.FunctionCallCount,
+		&sf.PayloadMetricsVersion,
 		&sf.StartedAt,
 		&sf.LastSeenAt,
 		&sf.LastTotalInputTokens,
@@ -300,6 +317,47 @@ func (db *DB) DeleteSourceFileEvents(ctx context.Context, path string) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM source_files WHERE path = ?`, path); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (db *DB) SessionSourcePaths(ctx context.Context, sessionID string) ([]string, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT path FROM source_files WHERE session_id = ? ORDER BY path`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
+func (db *DB) DeleteSession(ctx context.Context, sessionID string) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM token_events WHERE session_id = ?`, sessionID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM command_events WHERE session_id = ?`, sessionID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM payload_events WHERE session_id = ?`, sessionID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM source_files WHERE session_id = ?`, sessionID); err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -357,10 +415,11 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 	for _, payload := range payloads {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO payload_events (
 			session_id, source_path, timestamp, top_level_type, payload_type, phase, payload_bytes,
+			content_bytes, role, input_text_count, input_text_bytes,
 			completed_at, duration_ms, time_to_first_token_ms, command_name, normalized_command, call_id,
 			input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
 			model_context_window, model, payload_json, raw_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			payload.SessionID,
 			payload.SourcePath,
 			payload.Timestamp,
@@ -368,6 +427,10 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 			payload.PayloadType,
 			payload.Phase,
 			payload.PayloadBytes,
+			payload.ContentBytes,
+			payload.Role,
+			payload.InputTextCount,
+			payload.InputTextBytes,
 			payload.CompletedAt,
 			payload.DurationMS,
 			payload.TimeToFirstTokenMS,
@@ -397,6 +460,7 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 		session_dir,
 		model,
 		function_call_count,
+		payload_metrics_version,
 		started_at,
 		last_seen_at,
 		last_total_input_tokens,
@@ -404,7 +468,7 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 		last_total_output_tokens,
 		last_total_reasoning_tokens,
 		last_total_tokens
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		size_bytes = excluded.size_bytes,
 		mod_time_unix = excluded.mod_time_unix,
@@ -413,6 +477,7 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 		session_dir = COALESCE(NULLIF(excluded.session_dir, ''), source_files.session_dir),
 		model = COALESCE(NULLIF(excluded.model, ''), source_files.model),
 		function_call_count = excluded.function_call_count,
+		payload_metrics_version = excluded.payload_metrics_version,
 		started_at = COALESCE(NULLIF(source_files.started_at, ''), excluded.started_at),
 		last_seen_at = excluded.last_seen_at,
 		last_total_input_tokens = excluded.last_total_input_tokens,
@@ -428,6 +493,7 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 		source.SessionDir,
 		source.Model,
 		source.FunctionCallCount,
+		source.PayloadMetricsVersion,
 		source.StartedAt,
 		source.LastSeenAt,
 		source.LastTotalInputTokens,

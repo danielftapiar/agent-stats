@@ -155,3 +155,29 @@ func TestParseFileExtractsSessionDirectoryAndFunctionCalls(t *testing.T) {
 		t.Fatalf("expected token event model gpt-5.5, got %q", result.Events[0].Model)
 	}
 }
+
+func TestParseFileCalculatesPayloadContentMetrics(t *testing.T) {
+	input := strings.NewReader(`{"timestamp":"2026-06-20T09:00:00Z","type":"response_item","payload":{"type":"function_call_output","output":"hello world"}}
+{"timestamp":"2026-06-20T09:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"show sessions"},{"type":"output_text","text":"done"}]}}
+`)
+
+	result, err := ParseFile(input, "rollout.jsonl", "session", 0, rawUsage{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Payloads) != 2 {
+		t.Fatalf("expected 2 payload rows, got %d", len(result.Payloads))
+	}
+	if result.Payloads[0].ContentBytes != int64(len("hello world")) {
+		t.Fatalf("expected output bytes, got %+v", result.Payloads[0])
+	}
+	if result.Payloads[0].PayloadBytes <= result.Payloads[0].ContentBytes {
+		t.Fatalf("expected payload bytes to include raw json plus content bytes, got %+v", result.Payloads[0])
+	}
+	if result.Payloads[1].Role != "user" {
+		t.Fatalf("expected role user, got %q", result.Payloads[1].Role)
+	}
+	if result.Payloads[1].InputTextCount != 1 || result.Payloads[1].InputTextBytes != int64(len("show sessions")) {
+		t.Fatalf("expected input_text metrics, got %+v", result.Payloads[1])
+	}
+}
