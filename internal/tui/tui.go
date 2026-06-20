@@ -22,10 +22,7 @@ type tickMsg time.Time
 var viewNames = []string{
 	"summary",
 	"today",
-	"daily",
 	"sessions",
-	"cache",
-	"reasoning",
 	"commands",
 	"payload",
 	"tokens",
@@ -333,7 +330,7 @@ func (m model) updateDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func commandHelp() string {
-	return "commands: :summary :today :daily :sessions :cache :reasoning :commands :payload :tokens :top :theme :quit"
+	return "commands: :summary :today :sessions :commands :payload :tokens :top :theme :quit"
 }
 
 func (m model) updateThemePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

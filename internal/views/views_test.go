@@ -10,7 +10,7 @@ import (
 	"github.com/danieltapia/agent-stats/internal/store"
 )
 
-func TestLoadDailyAggregatesTokenEvents(t *testing.T) {
+func TestLoadTodayAggregatesTokenEvents(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
 	if err != nil {
@@ -48,15 +48,15 @@ func TestLoadDailyAggregatesTokenEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := Load(ctx, db, "daily", 20, time.Now())
+	data, err := Load(ctx, db, "today", 20, time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(data.Rows) != 1 {
-		t.Fatalf("expected 1 daily row, got %d", len(data.Rows))
+		t.Fatalf("expected 1 today row, got %d", len(data.Rows))
 	}
-	if data.Rows[0].Label != "2026-06-20" {
-		t.Fatalf("expected 2026-06-20 row, got %q", data.Rows[0].Label)
+	if data.Rows[0].Label != "session-a" {
+		t.Fatalf("expected session-a row, got %q", data.Rows[0].Label)
 	}
 	if data.Rows[0].Totals.TotalTokens != 45 {
 		t.Fatalf("expected 45 total tokens, got %d", data.Rows[0].Totals.TotalTokens)
@@ -341,53 +341,6 @@ func TestRenderRowsPlacesCreditsImmediatelyBeforeFCalls(t *testing.T) {
 	}
 }
 
-func TestLoadReasoningIncludesFunctionCallsByDay(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	err = db.SaveFileSync(ctx, store.SourceFile{
-		Path:              "source.jsonl",
-		SizeBytes:         10,
-		ModTimeUnix:       1,
-		ProcessedOffset:   10,
-		SessionID:         "session-a",
-		FunctionCallCount: 3,
-		LastSeenAt:        "2026-06-20T10:00:00Z",
-	}, []store.TokenEvent{
-		{
-			SessionID:             "session-a",
-			SourcePath:            "source.jsonl",
-			Timestamp:             "2026-06-20T10:00:00Z",
-			InputTokens:           100,
-			OutputTokens:          40,
-			ReasoningOutputTokens: 25,
-			TotalTokens:           140,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := Load(ctx, db, "reasoning", 20, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(data.Rows) != 1 {
-		t.Fatalf("expected 1 reasoning row, got %d", len(data.Rows))
-	}
-	if data.Rows[0].FunctionCalls != 3 {
-		t.Fatalf("expected 3 function calls, got %d", data.Rows[0].FunctionCalls)
-	}
-	rendered := Render(data, "reasoning")
-	if !strings.Contains(rendered, "FCalls") {
-		t.Fatalf("expected rendered reasoning table to include FCalls column:\n%s", rendered)
-	}
-}
-
 func TestLoadCommandsGroupsByCommandName(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
@@ -591,7 +544,7 @@ func TestFormatIntUsesCompactSuffixes(t *testing.T) {
 
 func TestRenderGraphUsesCompactYAxisUnits(t *testing.T) {
 	data := Data{
-		View: "daily",
+		View: "today",
 		Totals: Totals{
 			TotalTokens: 1_500_000_000,
 		},
@@ -601,7 +554,7 @@ func TestRenderGraphUsesCompactYAxisUnits(t *testing.T) {
 		},
 	}
 
-	rendered := Render(data, "daily")
+	rendered := Render(data, "today")
 	if !strings.Contains(rendered, "B") && !strings.Contains(rendered, "M") {
 		t.Fatalf("expected compact graph y-axis labels, got:\n%s", rendered)
 	}

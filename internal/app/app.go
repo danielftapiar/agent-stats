@@ -50,7 +50,7 @@ func Run(ctx context.Context, args []string, out io.Writer) error {
 	switch cmd {
 	case "", "tui":
 		return tui.Run(ctx, db, indexer)
-	case "summary", "today", "daily", "sessions", "cache", "reasoning", "commands", "payload", "tokens", "top", "graph":
+	case "summary", "today", "sessions", "commands", "payload", "tokens", "top", "graph":
 		return printView(ctx, out, db, cmd, opts)
 	case "export":
 		return exportJSON(ctx, out, db)
@@ -111,7 +111,7 @@ func parseArgs(args []string) (options, string, error) {
 
 func printView(ctx context.Context, out io.Writer, db *store.DB, cmd string, opts options) error {
 	if cmd == "graph" {
-		cmd = "daily"
+		cmd = "today"
 	}
 	var (
 		data views.Data
@@ -149,10 +149,7 @@ Usage:
   agent-stats [tui]
   agent-stats summary [--json]
   agent-stats today [--json]
-  agent-stats daily
   agent-stats sessions [--limit 20]
-  agent-stats cache
-  agent-stats reasoning
   agent-stats commands
   agent-stats payload [session-id]
   agent-stats tokens

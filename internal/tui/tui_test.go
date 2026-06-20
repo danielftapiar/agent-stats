@@ -17,7 +17,7 @@ import (
 
 func TestSmallWindowUsesScrollableViewport(t *testing.T) {
 	m := newTestModel(manyRowsData(40))
-	m.active = viewIndex("daily")
+	m.active = viewIndex("today")
 	m.configureViewport()
 	m.setViewportContent()
 

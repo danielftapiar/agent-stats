@@ -83,14 +83,8 @@ func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Ti
 	case "today":
 		start := now.Format("2006-01-02")
 		rows, err = queryGrouped(ctx, db, "session_id", "timestamp >= ?", limitOrDefault(limit), start)
-	case "daily":
-		rows, err = queryGrouped(ctx, db, "substr(timestamp, 1, 10)", "", 0)
 	case "sessions":
 		rows, err = queryGrouped(ctx, db, "session_id", "", limitOrDefault(limit))
-	case "cache":
-		rows, err = queryGrouped(ctx, db, "substr(timestamp, 1, 10)", "", 0)
-	case "reasoning":
-		rows, err = queryReasoning(ctx, db, "substr(timestamp, 1, 10)")
 	case "top":
 		rows, err = queryGrouped(ctx, db, "session_id", "", limitOrDefault(limit))
 	case "commands":
@@ -674,48 +668,6 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 	return rows, sqlRows.Err()
 }
 
-func queryReasoning(ctx context.Context, db *store.DB, groupExpr string) ([]Row, error) {
-	rows, err := queryGrouped(ctx, db, groupExpr, "reasoning_output_tokens > 0", 0)
-	if err != nil {
-		return nil, err
-	}
-	if err := attachFunctionCallsByDate(ctx, db, rows); err != nil {
-		return nil, err
-	}
-	return rows, nil
-}
-
-func attachFunctionCallsByDate(ctx context.Context, db *store.DB, rows []Row) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	byDate := make(map[string]int64, len(rows))
-	sqlRows, err := db.Query(ctx, `SELECT substr(COALESCE(NULLIF(last_seen_at, ''), started_at), 1, 10) AS label,
-		COALESCE(SUM(function_call_count), 0)
-		FROM source_files
-		WHERE COALESCE(NULLIF(last_seen_at, ''), started_at) != ''
-		GROUP BY label`)
-	if err != nil {
-		return err
-	}
-	defer sqlRows.Close()
-	for sqlRows.Next() {
-		var label string
-		var calls int64
-		if err := sqlRows.Scan(&label, &calls); err != nil {
-			return err
-		}
-		byDate[label] = calls
-	}
-	if err := sqlRows.Err(); err != nil {
-		return err
-	}
-	for i := range rows {
-		rows[i].FunctionCalls = byDate[rows[i].Label]
-	}
-	return nil
-}
-
 func queryTotals(ctx context.Context, db *store.DB, where string, args ...any) (Totals, error) {
 	query := `SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(reasoning_output_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(` + creditExpr + `), 0) FROM token_events` + creditJoins
 	if where != "" {
@@ -810,7 +762,7 @@ func Render(data Data, view string) string {
 	}
 	b.WriteString("\n")
 	switch view {
-	case "daily", "cache", "reasoning":
+	case "today":
 		writeGraph(&b, data.Rows, view)
 		b.WriteString("\n")
 	}
@@ -994,7 +946,7 @@ func writeTotals(b *strings.Builder, totals Totals) {
 func writeRows(b *strings.Builder, rows []Row, view string, selectedIndex int) {
 	includeDirectory := hasDirectory(rows)
 	includeModel := view == "sessions" && hasModel(rows)
-	includeCalls := view == "sessions" || view == "reasoning" || hasFunctionCalls(rows)
+	includeCalls := view == "sessions" || hasFunctionCalls(rows)
 	headers := []string{"Group"}
 	if includeDirectory {
 		headers = append(headers, "Directory")
@@ -1161,14 +1113,7 @@ func displayWidth(value string) int {
 func writeGraph(b *strings.Builder, rows []Row, view string) {
 	values := make([]float64, 0, len(rows))
 	for _, row := range rows {
-		value := float64(row.Totals.TotalTokens)
-		if view == "cache" {
-			value = row.Totals.CacheHitRate * 100
-		}
-		if view == "reasoning" {
-			value = float64(row.Totals.ReasoningOutputTokens)
-		}
-		values = append(values, value)
+		values = append(values, float64(row.Totals.TotalTokens))
 	}
 	if len(values) == 0 {
 		return
@@ -1204,9 +1149,6 @@ func writeCreditsGraph(b *strings.Builder, rows []Row, axisLabel string) {
 
 func graphValueFormatter(view string) func(float64) string {
 	return func(value float64) string {
-		if view == "cache" {
-			return fmt.Sprintf("%.1f%%", value)
-		}
 		return formatCompactFloat(value)
 	}
 }
