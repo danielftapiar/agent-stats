@@ -454,7 +454,9 @@ func (m *model) configureViewport() {
 }
 
 func (m *model) setViewportContent() {
-	m.viewport.SetContent(m.renderContent())
+	raw := m.renderPlainContent()
+	m.viewport.SetContent(m.themeContent(raw))
+	m.keepSelectedLineVisible(raw)
 }
 
 func (m *model) applyThemeToInput() {
@@ -491,6 +493,10 @@ func (m model) View() string {
 }
 
 func (m model) renderContent() string {
+	return m.themeContent(m.renderPlainContent())
+}
+
+func (m model) renderPlainContent() string {
 	if viewNames[m.active] == "sessions" {
 		m.data.SelectedIndex = m.row
 	}
@@ -500,7 +506,22 @@ func (m model) renderContent() string {
 	if m.inSessionPayload() && m.interaction == "" {
 		m.data.SelectedIndex = m.payloadRow
 	}
-	return m.themeContent(views.RenderWithWidth(m.data, viewNames[m.active], m.contentWidth()))
+	return views.RenderWithWidth(m.data, viewNames[m.active], m.contentWidth())
+}
+
+func (m *model) keepSelectedLineVisible(raw string) {
+	lineIndex := selectedLineIndex(raw)
+	if lineIndex < 0 || m.viewport.Height <= 0 {
+		return
+	}
+	if lineIndex < m.viewport.YOffset {
+		m.viewport.YOffset = lineIndex
+		return
+	}
+	bottom := m.viewport.YOffset + m.viewport.Height - 1
+	if lineIndex > bottom {
+		m.viewport.YOffset = lineIndex - m.viewport.Height + 1
+	}
 }
 
 func (m model) themeContent(content string) string {
@@ -629,6 +650,15 @@ func isTableHeader(line string) bool {
 
 func isSelectedLine(line string) bool {
 	return strings.HasPrefix(strings.TrimLeft(line, " "), selectedRowMarker)
+}
+
+func selectedLineIndex(content string) int {
+	for i, line := range strings.Split(content, "\n") {
+		if isSelectedLine(line) {
+			return i
+		}
+	}
+	return -1
 }
 
 func stripSelectedLineMarker(line string) string {

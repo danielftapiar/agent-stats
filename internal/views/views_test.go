@@ -577,6 +577,73 @@ func TestRenderGraphUsesCompactYAxisUnits(t *testing.T) {
 	}
 }
 
+func TestRenderWithWidthStretchesSummaryGraphAndTable(t *testing.T) {
+	data := Data{
+		View: "summary",
+		Rows: []Row{
+			{Label: "2026 May 18th", Totals: withDerived(Totals{InputTokens: 1000, TotalTokens: 1000, Credits: 20})},
+			{Label: "2026 May 11th", Totals: withDerived(Totals{InputTokens: 500, TotalTokens: 500, Credits: 10})},
+		},
+	}
+
+	rendered := RenderWithWidth(data, "summary", 140)
+	if maxGraphWidth(rendered) < 140 {
+		t.Fatalf("expected summary graph to stretch to at least 140 cells:\n%s", rendered)
+	}
+	if tableHeaderWidth(rendered, "Week") < 140 {
+		t.Fatalf("expected summary table header to stretch to 140 cells:\n%s", rendered)
+	}
+}
+
+func TestRenderWithWidthStretchesSessionTable(t *testing.T) {
+	data := Data{
+		View: "sessions",
+		Rows: []Row{{
+			Label:     "session-a",
+			Directory: "/Users/example/project",
+			Model:     "gpt-5.5",
+			Totals:    withDerived(Totals{InputTokens: 1000, TotalTokens: 1000, Credits: 20}),
+		}},
+	}
+
+	rendered := RenderWithWidth(data, "sessions", 160)
+	if tableHeaderWidth(rendered, "Group") < 160 {
+		t.Fatalf("expected sessions table header to stretch to 160 cells:\n%s", rendered)
+	}
+}
+
+func maxGraphWidth(rendered string) int {
+	maxWidth := 0
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.ContainsAny(line, "┤┼╭╮╯╰─│") {
+			if width := displayWidth(line); width > maxWidth {
+				maxWidth = width
+			}
+		}
+	}
+	return maxWidth
+}
+
+func tableHeaderWidth(rendered, prefix string) int {
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.HasPrefix(line, prefix) && isExpectedTableHeader(line, prefix) {
+			return displayWidth(line)
+		}
+	}
+	return 0
+}
+
+func isExpectedTableHeader(line, prefix string) bool {
+	switch prefix {
+	case "Week":
+		return strings.Contains(line, "Budget")
+	case "Group":
+		return strings.Contains(line, "Credits")
+	default:
+		return true
+	}
+}
+
 func assertTableLineAligned(t *testing.T, line string, columns []tableColumn, expected []string) {
 	t.Helper()
 	start := 0

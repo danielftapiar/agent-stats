@@ -116,6 +116,30 @@ func TestVimKeysScrollHorizontally(t *testing.T) {
 	}
 }
 
+func TestSessionSelectionScrollsVerticallyAtBottom(t *testing.T) {
+	data := manyRowsData(30)
+	data.View = "sessions"
+	m := newTestModel(data)
+	m.active = viewIndex("sessions")
+	m.viewport = viewport.New(80, 8)
+	m.setViewportContent()
+
+	for i := 0; i < 20; i++ {
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m = updated.(model)
+	}
+
+	if m.row != 20 {
+		t.Fatalf("expected selected row 20, got %d", m.row)
+	}
+	if m.viewport.YOffset == 0 {
+		t.Fatal("expected viewport to scroll down with selected session row")
+	}
+	if !strings.Contains(m.viewport.View(), "session-20") {
+		t.Fatalf("expected selected session to be visible after scrolling:\n%s", m.viewport.View())
+	}
+}
+
 func TestSummaryVimSelectionDrillsIntoSelectedWeek(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))

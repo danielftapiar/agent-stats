@@ -792,11 +792,11 @@ func RenderWithWidth(data Data, view string, width int) string {
 			return b.String()
 		}
 		b.WriteString("\n")
-		writeCommandRows(&b, data.Rows)
+		writeCommandRows(&b, data.Rows, width)
 		return b.String()
 	}
 	if view == "payload" {
-		writePayloadSummary(&b, data)
+		writePayloadSummary(&b, data, width)
 		if data.Interaction != "" {
 			return b.String()
 		}
@@ -806,14 +806,14 @@ func RenderWithWidth(data Data, view string, width int) string {
 		}
 		b.WriteString("\n")
 		if data.Session != "" {
-			writePayloadSessionRows(&b, data.Rows, data.SelectedIndex)
+			writePayloadSessionRows(&b, data.Rows, data.SelectedIndex, width)
 		} else {
-			writePayloadRows(&b, data.Rows)
+			writePayloadRows(&b, data.Rows, width)
 		}
 		return b.String()
 	}
 	if view == "summary" {
-		writeSummary(&b, data)
+		writeSummary(&b, data, width)
 		return b.String()
 	}
 	writeTotals(&b, data.Totals)
@@ -834,7 +834,7 @@ func RenderWithWidth(data Data, view string, width int) string {
 	if view == "sessions" && data.Period == "day" && data.PeriodStart != "" {
 		fmt.Fprintf(&b, "Day: %s\n\n", formatDateLabel(data.PeriodStart))
 	}
-	writeRows(&b, data.Rows, view, data.SelectedIndex)
+	writeRows(&b, data.Rows, view, data.SelectedIndex, width)
 	return b.String()
 }
 
@@ -847,7 +847,7 @@ func writeCommandSummary(b *strings.Builder, rows []Row) {
 	fmt.Fprintf(b, "Commands: %d  Calls: %s  Session refs: %s\n", len(rows), formatInt(calls), formatInt(sessions))
 }
 
-func writeSummary(b *strings.Builder, data Data) {
+func writeSummary(b *strings.Builder, data Data, width int) {
 	var credits float64
 	var calls int64
 	for _, row := range data.Rows {
@@ -859,7 +859,7 @@ func writeSummary(b *strings.Builder, data Data) {
 	} else {
 		fmt.Fprintf(b, "Weekly credits: %s  Function calls: %s\n\n", formatCredits(credits), formatInt(calls))
 	}
-	writeCreditsGraph(b, data.Rows)
+	writeCreditsGraph(b, data.Rows, width)
 	b.WriteString("\n")
 	tableRows := [][]string{{summaryFirstColumn(data), "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls"}}
 	for i, row := range data.Rows {
@@ -877,7 +877,7 @@ func writeSummary(b *strings.Builder, data Data) {
 			formatInt(row.FunctionCalls),
 		})
 	}
-	columns := columnsFor(tableRows)
+	columns := columnsForWidth(tableRows, width)
 	for _, row := range tableRows {
 		writeTableLine(b, columns, row)
 	}
@@ -890,7 +890,7 @@ func summaryFirstColumn(data Data) string {
 	return "Week"
 }
 
-func writeCommandRows(b *strings.Builder, rows []Row) {
+func writeCommandRows(b *strings.Builder, rows []Row, width int) {
 	tableRows := [][]string{{"Command", "Kind", "FCalls", "Sessions", "Directories"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
@@ -901,13 +901,13 @@ func writeCommandRows(b *strings.Builder, rows []Row) {
 			row.Directory,
 		})
 	}
-	columns := columnsFor(tableRows)
+	columns := columnsForWidth(tableRows, width)
 	for _, row := range tableRows {
 		writeTableLine(b, columns, row)
 	}
 }
 
-func writePayloadSummary(b *strings.Builder, data Data) {
+func writePayloadSummary(b *strings.Builder, data Data, width int) {
 	if data.Session == "" {
 		var count, bytes int64
 		for _, row := range data.Rows {
@@ -938,13 +938,13 @@ func writePayloadSummary(b *strings.Builder, data Data) {
 			formatDuration(row.AvgTTFTMS),
 		})
 	}
-	columns := columnsFor(tableRows)
+	columns := columnsForWidth(tableRows, width)
 	for _, row := range tableRows {
 		writeTableLine(b, columns, row)
 	}
 }
 
-func writePayloadRows(b *strings.Builder, rows []Row) {
+func writePayloadRows(b *strings.Builder, rows []Row, width int) {
 	tableRows := [][]string{{"Payload", "Phase", "Count", "Payload Bytes", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
@@ -959,13 +959,13 @@ func writePayloadRows(b *strings.Builder, rows []Row) {
 			formatDuration(row.AvgTTFTMS),
 		})
 	}
-	columns := columnsFor(tableRows)
+	columns := columnsForWidth(tableRows, width)
 	for _, row := range tableRows {
 		writeTableLine(b, columns, row)
 	}
 }
 
-func writePayloadSessionRows(b *strings.Builder, rows []Row, selectedIndex int) {
+func writePayloadSessionRows(b *strings.Builder, rows []Row, selectedIndex int, width int) {
 	tableRows := [][]string{{"Interaction", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Payload Bytes", "Dur", "TTFT", "Hit Rate"}}
 	for i, row := range rows {
 		label := compactTime(row.Label)
@@ -985,7 +985,7 @@ func writePayloadSessionRows(b *strings.Builder, rows []Row, selectedIndex int) 
 			fmt.Sprintf("%.1f%%", row.Totals.CacheHitRate*100),
 		})
 	}
-	columns := columnsFor(tableRows)
+	columns := columnsForWidth(tableRows, width)
 	for _, row := range tableRows {
 		writeTableLine(b, columns, row)
 	}
@@ -1004,7 +1004,7 @@ func writeTotals(b *strings.Builder, totals Totals) {
 	)
 }
 
-func writeRows(b *strings.Builder, rows []Row, view string, selectedIndex int) {
+func writeRows(b *strings.Builder, rows []Row, view string, selectedIndex int, width int) {
 	includeDirectory := hasDirectory(rows)
 	includeModel := view == "sessions" && hasModel(rows)
 	includeCalls := view == "sessions" || hasFunctionCalls(rows)
@@ -1047,7 +1047,7 @@ func writeRows(b *strings.Builder, rows []Row, view string, selectedIndex int) {
 		)
 		tableRows = append(tableRows, values)
 	}
-	columns := columnsFor(tableRows)
+	columns := columnsForWidth(tableRows, width)
 	for _, row := range tableRows {
 		writeTableLine(b, columns, row)
 	}
@@ -1084,6 +1084,38 @@ func columnsFor(rows [][]string) []tableColumn {
 		}
 	}
 	return columns
+}
+
+func columnsForWidth(rows [][]string, targetWidth int) []tableColumn {
+	columns := columnsFor(rows)
+	if targetWidth <= 0 || len(columns) == 0 {
+		return columns
+	}
+	currentWidth := tableWidth(columns)
+	if currentWidth >= targetWidth {
+		return columns
+	}
+	extra := targetWidth - currentWidth
+	base := extra / len(columns)
+	remainder := extra % len(columns)
+	for i := range columns {
+		columns[i].width += base
+		if i < remainder {
+			columns[i].width++
+		}
+	}
+	return columns
+}
+
+func tableWidth(columns []tableColumn) int {
+	if len(columns) == 0 {
+		return 0
+	}
+	width := len(columns) - 1
+	for _, col := range columns {
+		width += col.width
+	}
+	return width
 }
 
 func tableColumnFor(header string) tableColumn {
@@ -1190,7 +1222,7 @@ func writeGraph(b *strings.Builder, rows []Row, view string, width int) {
 	b.WriteString("\n")
 }
 
-func writeCreditsGraph(b *strings.Builder, rows []Row) {
+func writeCreditsGraph(b *strings.Builder, rows []Row, width int) {
 	if len(rows) == 0 {
 		return
 	}
@@ -1198,9 +1230,16 @@ func writeCreditsGraph(b *strings.Builder, rows []Row) {
 	for i := len(rows) - 1; i >= 0; i-- {
 		values = append(values, rows[i].Totals.Credits)
 	}
-	b.WriteString(asciigraph.Plot(values, asciigraph.Height(8), asciigraph.YAxisValueFormatter(func(value float64) string {
-		return formatCredits(value)
-	})))
+	options := []asciigraph.Option{
+		asciigraph.Height(8),
+		asciigraph.YAxisValueFormatter(func(value float64) string {
+			return formatCredits(value)
+		}),
+	}
+	if width > 0 {
+		options = append(options, asciigraph.Width(width))
+	}
+	b.WriteString(asciigraph.Plot(values, options...))
 	b.WriteString("\n")
 }
 
