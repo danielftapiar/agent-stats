@@ -131,13 +131,13 @@ func TestLoadSummaryGroupsWeeklyCreditsAndFunctionCalls(t *testing.T) {
 		SessionDir:        "/Users/example/project",
 		Model:             "gpt-5.5",
 		FunctionCallCount: 1,
-		LastSeenAt:        "2026-06-20T10:00:00Z",
+		LastSeenAt:        "2026-05-18T10:00:00Z",
 	}
 	events := []store.TokenEvent{
-		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", InputTokens: 1_000_000, CachedInputTokens: 1_000_000, OutputTokens: 500_000, ReasoningOutputTokens: 250_000, TotalTokens: 1_500_000, Model: "gpt-5.5"},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-18T10:00:00Z", InputTokens: 1_000_000, CachedInputTokens: 1_000_000, OutputTokens: 500_000, ReasoningOutputTokens: 250_000, TotalTokens: 1_500_000, Model: "gpt-5.5"},
 	}
 	commands := []store.CommandEvent{
-		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", EventType: "function_call", CommandName: "exec_command", SessionDir: "/Users/example/project"},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-18T10:00:00Z", EventType: "function_call", CommandName: "exec_command", SessionDir: "/Users/example/project"},
 	}
 	if err := db.SaveFileSyncWithCommands(ctx, source, events, commands); err != nil {
 		t.Fatal(err)
@@ -149,6 +149,9 @@ func TestLoadSummaryGroupsWeeklyCreditsAndFunctionCalls(t *testing.T) {
 	}
 	if len(data.Rows) != 1 {
 		t.Fatalf("expected 1 weekly summary row, got %d", len(data.Rows))
+	}
+	if data.Rows[0].Label != "2026 May 18th" {
+		t.Fatalf("expected Monday week label 2026 May 18th, got %q", data.Rows[0].Label)
 	}
 	if data.Rows[0].FunctionCalls != 1 {
 		t.Fatalf("expected 1 function call, got %d", data.Rows[0].FunctionCalls)
@@ -417,8 +420,8 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 	data := Data{
 		View: "summary",
 		Rows: []Row{
-			{Label: "2026-W24", FunctionCalls: 1234, LastSeen: "2026-06-20T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1740918485, InputTokens: 1733772383, CachedInputTokens: 1656928512, OutputTokens: 5163766, ReasoningOutputTokens: 1770977, Credits: 4200.5})},
-			{Label: "2026-W23", FunctionCalls: 12, LastSeen: "2026-06-13T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1200, InputTokens: 1000, CachedInputTokens: 200, OutputTokens: 200, Credits: 0.5})},
+			{Label: "2026 May 18th", FunctionCalls: 1234, LastSeen: "2026-06-20T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1740918485, InputTokens: 1733772383, CachedInputTokens: 1656928512, OutputTokens: 5163766, ReasoningOutputTokens: 1770977, Credits: 4200.5})},
+			{Label: "2026 May 11th", FunctionCalls: 12, LastSeen: "2026-06-13T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1200, InputTokens: 1000, CachedInputTokens: 200, OutputTokens: 200, Credits: 0.5})},
 		},
 	}
 
@@ -437,8 +440,9 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 	rendered := strings.Join(lines, "\n")
 	for _, want := range []string{
 		"Week", "Credits", "Budget", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls",
-		"2026-W24", "████████░░░░░░░░░░░░ 4.2K/10K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K",
-		"2026-W23", "░░░░░░░░░░░░░░░░░░░░ 0.5/10K", "1.2K",
+		"Weeks: 2026 May 11th 2026 May 18th",
+		"2026 May 18th", "████████░░░░░░░░░░░░ 4.2K/10K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K",
+		"2026 May 11th", "░░░░░░░░░░░░░░░░░░░░ 0.5/10K", "1.2K",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected rendered summary to contain %q:\n%s", want, rendered)

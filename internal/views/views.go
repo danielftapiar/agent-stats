@@ -141,7 +141,7 @@ const creditJoins = ` LEFT JOIN model_credit_rates rate ON rate.model = COALESCE
 
 func queryWeeklySummary(ctx context.Context, db *store.DB) ([]Row, error) {
 	query := `WITH weekly_tokens AS (
-		SELECT strftime('%Y-W%W', timestamp) AS label,
+		SELECT date(timestamp, '-6 days', 'weekday 1') AS label,
 			SUM(input_tokens) AS input_tokens,
 			SUM(cached_input_tokens) AS cached_input_tokens,
 			SUM(output_tokens) AS output_tokens,
@@ -152,7 +152,7 @@ func queryWeeklySummary(ctx context.Context, db *store.DB) ([]Row, error) {
 		GROUP BY label
 	),
 	weekly_calls AS (
-		SELECT strftime('%Y-W%W', timestamp) AS label, COUNT(*) AS function_calls
+		SELECT date(timestamp, '-6 days', 'weekday 1') AS label, COUNT(*) AS function_calls
 		FROM command_events
 		GROUP BY label
 	)
@@ -187,6 +187,7 @@ func queryWeeklySummary(ctx context.Context, db *store.DB) ([]Row, error) {
 		); err != nil {
 			return nil, err
 		}
+		row.Label = formatWeekStart(row.Label)
 		row.Totals = withDerived(row.Totals)
 		rows = append(rows, row)
 	}
@@ -748,6 +749,8 @@ func writeWeeklySummary(b *strings.Builder, rows []Row) {
 		calls += row.FunctionCalls
 	}
 	fmt.Fprintf(b, "Weekly credits: %s  Function calls: %s\n\n", formatCredits(credits), formatInt(calls))
+	writeCreditsGraph(b, rows)
+	b.WriteString("\n")
 	tableRows := [][]string{{"Week", "Credits", "Budget", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
@@ -1066,6 +1069,24 @@ func writeGraph(b *strings.Builder, rows []Row, view string) {
 	b.WriteString("\n")
 }
 
+func writeCreditsGraph(b *strings.Builder, rows []Row) {
+	if len(rows) == 0 {
+		return
+	}
+	values := make([]float64, 0, len(rows))
+	labels := make([]string, 0, len(rows))
+	for i := len(rows) - 1; i >= 0; i-- {
+		values = append(values, rows[i].Totals.Credits)
+		labels = append(labels, rows[i].Label)
+	}
+	b.WriteString(asciigraph.Plot(values, asciigraph.Height(8), asciigraph.YAxisValueFormatter(func(value float64) string {
+		return formatCredits(value)
+	})))
+	b.WriteString("\nWeeks: ")
+	b.WriteString(strings.Join(labels, " "))
+	b.WriteString("\n")
+}
+
 func graphValueFormatter(view string) func(float64) string {
 	return func(value float64) string {
 		if view == "cache" {
@@ -1224,6 +1245,30 @@ func formatDuration(ms int64) string {
 	}
 	minutes := seconds / 60
 	return trimCompactFloat(minutes) + "m"
+}
+
+func formatWeekStart(value string) string {
+	parsed, err := time.Parse("2006-01-02", value)
+	if err != nil {
+		return value
+	}
+	return fmt.Sprintf("%04d %s %d%s", parsed.Year(), parsed.Month().String(), parsed.Day(), ordinalSuffix(parsed.Day()))
+}
+
+func ordinalSuffix(day int) string {
+	if day%100 >= 11 && day%100 <= 13 {
+		return "th"
+	}
+	switch day % 10 {
+	case 1:
+		return "st"
+	case 2:
+		return "nd"
+	case 3:
+		return "rd"
+	default:
+		return "th"
+	}
 }
 
 func diffMillis(start, end string) int64 {
