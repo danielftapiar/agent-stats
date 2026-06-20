@@ -8,8 +8,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/danieltapia/agent-stats/internal/store"
 	"github.com/guptarohit/asciigraph"
+	"github.com/muesli/termenv"
 )
 
 type Totals struct {
@@ -951,8 +954,8 @@ func columnsFor(rows [][]string) []tableColumn {
 			if i >= len(columns) {
 				continue
 			}
-			if len(value) > columns[i].width {
-				columns[i].width = len(value)
+			if width := displayWidth(value); width > columns[i].width {
+				columns[i].width = width
 			}
 		}
 	}
@@ -1022,20 +1025,26 @@ func writeTableLine(b *strings.Builder, columns []tableColumn, values []string) 
 }
 
 func center(value string, width int) string {
-	if len(value) >= width {
+	valueWidth := displayWidth(value)
+	if valueWidth >= width {
 		return value
 	}
-	padding := width - len(value)
+	padding := width - valueWidth
 	left := padding / 2
 	right := padding - left
 	return strings.Repeat(" ", left) + value + strings.Repeat(" ", right)
 }
 
 func padRight(value string, width int) string {
-	if len(value) >= width {
+	valueWidth := displayWidth(value)
+	if valueWidth >= width {
 		return value
 	}
-	return value + strings.Repeat(" ", width-len(value))
+	return value + strings.Repeat(" ", width-valueWidth)
+}
+
+func displayWidth(value string) int {
+	return lipgloss.Width(value)
 }
 
 func writeGraph(b *strings.Builder, rows []Row, view string) {
@@ -1072,6 +1081,15 @@ func progressBar(value, max float64, width int) string {
 	if width <= 0 {
 		return ""
 	}
+	bar := progress.New(
+		progress.WithWidth(width),
+		progress.WithoutPercentage(),
+		progress.WithColorProfile(termenv.Ascii),
+	)
+	return fmt.Sprintf("%s %s/%s", bar.ViewAs(progressRatio(value, max)), formatCredits(value), formatCredits(max))
+}
+
+func progressRatio(value, max float64) float64 {
 	if max <= 0 {
 		max = 1
 	}
@@ -1082,12 +1100,7 @@ func progressBar(value, max float64, width int) string {
 	if ratio > 1 {
 		ratio = 1
 	}
-	filled := int(math.Round(ratio * float64(width)))
-	if filled > width {
-		filled = width
-	}
-	empty := width - filled
-	return fmt.Sprintf("[%s%s] %s/%s", strings.Repeat("#", filled), strings.Repeat("-", empty), formatCredits(value), formatCredits(max))
+	return ratio
 }
 
 func addTotals(a, b Totals) Totals {

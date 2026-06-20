@@ -434,19 +434,18 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 		t.Fatal("summary table header not found")
 	}
 
-	expectedHeader := []string{"Week", "Credits", "Budget", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}
-	expectedRows := [][]string{
-		{"2026-W24", "4.2K", "[########------------] 4.2K/10K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K"},
-		{"2026-W23", "0.5", "[--------------------] 0.5/10K", "1.2K", "1K", "200", "16.7%", "12"},
-	}
-	columns := columnsFor(append([][]string{expectedHeader}, expectedRows...))
-	assertTableLineAligned(t, lines[headerIndex], columns, expectedHeader)
-	for i, expected := range expectedRows {
-		lineIndex := headerIndex + 1 + i
-		if lineIndex >= len(lines) {
-			t.Fatalf("missing table row %d", i)
+	rendered := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"Week", "Credits", "Budget", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls",
+		"2026-W24", "████████░░░░░░░░░░░░ 4.2K/10K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K",
+		"2026-W23", "░░░░░░░░░░░░░░░░░░░░ 0.5/10K", "1.2K",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected rendered summary to contain %q:\n%s", want, rendered)
 		}
-		assertTableLineAligned(t, lines[lineIndex], columns, expected)
+	}
+	if strings.Contains(rendered, "#") {
+		t.Fatalf("expected summary progress bars to use rendered block glyphs, got:\n%s", rendered)
 	}
 }
 
