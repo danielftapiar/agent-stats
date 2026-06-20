@@ -131,7 +131,12 @@ func LoadPayloadInteraction(ctx context.Context, db *store.DB, sessionID, intera
 	return Data{View: "payload", Session: sessionID, Interaction: interaction, SelectedIndex: -1, Summary: summary}, nil
 }
 
-const creditExpr = `(token_events.input_tokens * COALESCE(rate.input_credits_per_million, fallback.input_credits_per_million) +
+const uncachedInputExpr = `(CASE
+	WHEN token_events.input_tokens >= token_events.cached_input_tokens THEN token_events.input_tokens - token_events.cached_input_tokens
+	ELSE token_events.input_tokens
+END)`
+
+const creditExpr = `(` + uncachedInputExpr + ` * COALESCE(rate.input_credits_per_million, fallback.input_credits_per_million) +
 	token_events.cached_input_tokens * COALESCE(rate.cached_input_credits_per_million, fallback.cached_input_credits_per_million) +
 	token_events.output_tokens * COALESCE(rate.output_credits_per_million, fallback.output_credits_per_million) +
 	token_events.reasoning_output_tokens * COALESCE(rate.reasoning_credits_per_million, fallback.reasoning_credits_per_million)) / 1000000.0`
@@ -505,7 +510,7 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 			return nil, err
 		}
 		return []Row{
-			{Label: "uncached input", Totals: withDerived(Totals{TotalTokens: totals.InputTokens, InputTokens: totals.InputTokens, Credits: tokenTypeCredits(ctx, db, "input_tokens", where, args...)})},
+			{Label: "uncached input", Totals: withDerived(Totals{TotalTokens: totals.UncachedInputTokens, InputTokens: totals.UncachedInputTokens, Credits: tokenTypeCredits(ctx, db, "uncached_input_tokens", where, args...)})},
 			{Label: "cache read", Totals: withDerived(Totals{TotalTokens: totals.CachedInputTokens, CachedInputTokens: totals.CachedInputTokens, Credits: tokenTypeCredits(ctx, db, "cached_input_tokens", where, args...)})},
 			{Label: "cache creation", Totals: withDerived(Totals{})},
 			{Label: "output", Totals: Totals{TotalTokens: totals.OutputTokens, OutputTokens: totals.OutputTokens, Credits: tokenTypeCredits(ctx, db, "output_tokens", where, args...)}},
@@ -655,7 +660,7 @@ func queryTotals(ctx context.Context, db *store.DB, where string, args ...any) (
 
 func tokenTypeCredits(ctx context.Context, db *store.DB, column, where string, args ...any) float64 {
 	rateColumn := map[string]string{
-		"input_tokens":            "input_credits_per_million",
+		"uncached_input_tokens":   "input_credits_per_million",
 		"cached_input_tokens":     "cached_input_credits_per_million",
 		"output_tokens":           "output_credits_per_million",
 		"reasoning_output_tokens": "reasoning_credits_per_million",
@@ -663,8 +668,12 @@ func tokenTypeCredits(ctx context.Context, db *store.DB, column, where string, a
 	if rateColumn == "" {
 		return 0
 	}
-	query := fmt.Sprintf(`SELECT COALESCE(SUM(token_events.%s * COALESCE(rate.%s, fallback.%s)) / 1000000.0, 0)
-		FROM token_events%s`, column, rateColumn, rateColumn, creditJoins)
+	tokenExpr := "token_events." + column
+	if column == "uncached_input_tokens" {
+		tokenExpr = uncachedInputExpr
+	}
+	query := fmt.Sprintf(`SELECT COALESCE(SUM(%s * COALESCE(rate.%s, fallback.%s)) / 1000000.0, 0)
+		FROM token_events%s`, tokenExpr, rateColumn, rateColumn, creditJoins)
 	if where != "" {
 		query += " WHERE " + where
 	}
@@ -751,7 +760,7 @@ func writeWeeklySummary(b *strings.Builder, rows []Row) {
 	fmt.Fprintf(b, "Weekly credits: %s  Function calls: %s\n\n", formatCredits(credits), formatInt(calls))
 	writeCreditsGraph(b, rows)
 	b.WriteString("\n")
-	tableRows := [][]string{{"Week", "Credits", "Budget", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}}
+	tableRows := [][]string{{"Week", "Credits", "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
 			row.Label,
@@ -1147,8 +1156,11 @@ func cacheHitRate(t Totals) float64 {
 }
 
 func withDerived(t Totals) Totals {
-	if t.UncachedInputTokens == 0 {
-		t.UncachedInputTokens = t.InputTokens
+	if t.UncachedInputTokens == 0 && t.InputTokens > 0 {
+		t.UncachedInputTokens = t.InputTokens - t.CachedInputTokens
+		if t.UncachedInputTokens < 0 {
+			t.UncachedInputTokens = t.InputTokens
+		}
 	}
 	if t.CacheReadInputTokens == 0 {
 		t.CacheReadInputTokens = t.CachedInputTokens

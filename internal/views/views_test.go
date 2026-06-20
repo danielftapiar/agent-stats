@@ -72,6 +72,20 @@ func TestLoadDailyAggregatesTokenEvents(t *testing.T) {
 	}
 }
 
+func TestWithDerivedTreatsCachedInputAsInputSubset(t *testing.T) {
+	totals := withDerived(Totals{
+		InputTokens:       1_000,
+		CachedInputTokens: 750,
+	})
+
+	if totals.UncachedInputTokens != 250 {
+		t.Fatalf("expected uncached input to be input-cached, got %d", totals.UncachedInputTokens)
+	}
+	if totals.CacheHitRate != 0.75 {
+		t.Fatalf("expected cache hit rate 0.75, got %f", totals.CacheHitRate)
+	}
+}
+
 func TestLoadSummaryDoesNotDoubleCountTokenTypeRows(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
@@ -156,8 +170,8 @@ func TestLoadSummaryGroupsWeeklyCreditsAndFunctionCalls(t *testing.T) {
 	if data.Rows[0].FunctionCalls != 1 {
 		t.Fatalf("expected 1 function call, got %d", data.Rows[0].FunctionCalls)
 	}
-	if data.Rows[0].Totals.Credits != 4.25 {
-		t.Fatalf("expected 4.25 credits, got %f", data.Rows[0].Totals.Credits)
+	if data.Rows[0].Totals.Credits != 80.5 {
+		t.Fatalf("expected 80.5 credits, got %f", data.Rows[0].Totals.Credits)
 	}
 }
 
@@ -439,9 +453,9 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 
 	rendered := strings.Join(lines, "\n")
 	for _, want := range []string{
-		"Week", "Credits", "Budget", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls",
+		"Week", "Credits", "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls",
 		"Weeks: 2026 May 11th 2026 May 18th",
-		"2026 May 18th", "████████░░░░░░░░░░░░ 4.2K/10K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K",
+		"2026 May 18th", "████████░░░░░░░░░░░░ 4.2K/10K", "1.74B", "76.8M", "1.66B", "95.6%", "1.23K",
 		"2026 May 11th", "░░░░░░░░░░░░░░░░░░░░ 0.5/10K", "1.2K",
 	} {
 		if !strings.Contains(rendered, want) {
