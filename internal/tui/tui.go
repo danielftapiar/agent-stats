@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -495,9 +496,12 @@ func (m model) themeContent(content string) string {
 		case isTableHeader(line):
 			lines[i] = m.theme.TableHeader.Render(line)
 		case isSelectedLine(line):
-			lines[i] = m.theme.SelectedRow.Width(m.selectedRowWidth(line)).Render(line)
+			cleanLine := stripSelectedLineMarker(line)
+			lines[i] = m.theme.SelectedRow.Width(m.selectedRowWidth(cleanLine)).Render(cleanLine)
 		case strings.ContainsAny(line, "┤┼╭╮╯╰─│"):
 			lines[i] = m.theme.Graph.Render(line)
+		default:
+			lines[i] = m.themeProgressBars(line)
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -603,8 +607,23 @@ func isTableHeader(line string) bool {
 }
 
 func isSelectedLine(line string) bool {
-	return strings.HasPrefix(strings.TrimLeft(line, " "), "> ")
+	return strings.HasPrefix(strings.TrimLeft(line, " "), selectedRowMarker)
 }
+
+func stripSelectedLineMarker(line string) string {
+	prefixLen := len(line) - len(strings.TrimLeft(line, " "))
+	return line[:prefixLen] + strings.TrimPrefix(line[prefixLen:], selectedRowMarker)
+}
+
+func (m model) themeProgressBars(line string) string {
+	return progressGlyphPattern.ReplaceAllStringFunc(line, func(match string) string {
+		return m.theme.Progress.Render(match)
+	})
+}
+
+const selectedRowMarker = "\x1f"
+
+var progressGlyphPattern = regexp.MustCompile(`[█░]+`)
 
 func (m model) renderThemePicker() string {
 	var b strings.Builder

@@ -295,8 +295,11 @@ func TestRenderSessionsMarksSelectedRow(t *testing.T) {
 	}
 
 	rendered := Render(data, "sessions")
-	if !strings.Contains(rendered, "> session-b") {
-		t.Fatalf("expected selected session marker on second row:\n%s", rendered)
+	if !strings.Contains(rendered, selectedRowMarker+"session-b") {
+		t.Fatalf("expected internal selected session marker on second row:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "> session-b") {
+		t.Fatalf("expected selected row not to render visible > marker:\n%s", rendered)
 	}
 }
 

@@ -53,6 +53,38 @@ func TestThemeRendersVisibleFrameAndContentAccents(t *testing.T) {
 	}
 }
 
+func TestSelectedRowRendersWithoutVisibleMarker(t *testing.T) {
+	m := newTestModel(views.Data{
+		View:          "sessions",
+		SelectedIndex: 0,
+		Rows: []views.Row{{
+			Label:  "session-a",
+			Totals: views.Totals{InputTokens: 10, TotalTokens: 10},
+		}},
+	})
+	m.active = viewIndex("sessions")
+	m.row = 0
+
+	rendered := m.renderContent()
+	if strings.Contains(rendered, "> session-a") {
+		t.Fatalf("expected selected row to omit visible marker:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "session-a") {
+		t.Fatalf("expected selected row label to remain visible:\n%s", rendered)
+	}
+}
+
+func TestProgressBarsUseThemeAccent(t *testing.T) {
+	m := newTestModel(views.Data{})
+	if m.theme.Progress.GetForeground() != m.theme.TableHeader.GetBackground() {
+		t.Fatalf("expected progress foreground to match table header background")
+	}
+	rendered := m.themeProgressBars("████░░░░ 2K/10K")
+	if !strings.Contains(rendered, "2K/10K") {
+		t.Fatalf("expected progress label to remain unmodified, got %q", rendered)
+	}
+}
+
 func TestVimKeysScrollHorizontally(t *testing.T) {
 	m := newTestModel(views.Data{
 		View: "sessions",
@@ -160,7 +192,7 @@ func TestSelectedRowCanScrollHorizontallyInSmallWindow(t *testing.T) {
 	if before == afterRight {
 		t.Fatal("expected selected row to preserve horizontal overflow for scrolling")
 	}
-	if m.selectedRowWidth("> session-with-a-long-visible-row") <= m.contentWidth() {
+	if m.selectedRowWidth("session-with-a-long-visible-row") <= m.contentWidth() {
 		t.Fatal("expected selected row style width to preserve the full row width")
 	}
 }

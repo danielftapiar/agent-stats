@@ -61,6 +61,8 @@ type Data struct {
 	Rows          []Row  `json:"rows"`
 }
 
+const selectedRowMarker = "\x1f"
+
 func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Time) (Data, error) {
 	var (
 		rows []Row
@@ -843,7 +845,7 @@ func writeSummary(b *strings.Builder, data Data) {
 	for i, row := range data.Rows {
 		label := row.Label
 		if i == data.SelectedIndex {
-			label = "> " + label
+			label = selectedRowMarker + label
 		}
 		tableRows = append(tableRows, []string{
 			label,
@@ -955,7 +957,7 @@ func writePayloadSessionRows(b *strings.Builder, rows []Row, selectedIndex int) 
 	for i, row := range rows {
 		label := compactTime(row.Label)
 		if i == selectedIndex {
-			label = "> " + label
+			label = selectedRowMarker + label
 		}
 		tableRows = append(tableRows, []string{
 			label,
@@ -1008,7 +1010,7 @@ func writeRows(b *strings.Builder, rows []Row, view string, selectedIndex int) {
 	for i, row := range rows {
 		label := row.Label
 		if view == "sessions" && i == selectedIndex {
-			label = "> " + label
+			label = selectedRowMarker + label
 		}
 		values := []string{truncate(label, 36)}
 		if includeDirectory {
