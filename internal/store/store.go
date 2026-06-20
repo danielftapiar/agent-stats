@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -14,13 +15,18 @@ type DB struct {
 }
 
 type SourceFile struct {
-	Path            string
-	SizeBytes       int64
-	ModTimeUnix     int64
-	ProcessedOffset int64
-	SessionID       string
-	StartedAt       string
-	LastSeenAt      string
+	Path                       string
+	SizeBytes                  int64
+	ModTimeUnix                int64
+	ProcessedOffset            int64
+	SessionID                  string
+	StartedAt                  string
+	LastSeenAt                 string
+	LastTotalInputTokens       int64
+	LastTotalCachedInputTokens int64
+	LastTotalOutputTokens      int64
+	LastTotalReasoningTokens   int64
+	LastTotalTokens            int64
 }
 
 type TokenEvent struct {
@@ -77,8 +83,18 @@ func (db *DB) migrate(ctx context.Context) error {
 			processed_offset INTEGER NOT NULL,
 			session_id TEXT NOT NULL,
 			started_at TEXT,
-			last_seen_at TEXT
+			last_seen_at TEXT,
+			last_total_input_tokens INTEGER NOT NULL DEFAULT 0,
+			last_total_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+			last_total_output_tokens INTEGER NOT NULL DEFAULT 0,
+			last_total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+			last_total_tokens INTEGER NOT NULL DEFAULT 0
 		)`,
+		`ALTER TABLE source_files ADD COLUMN last_total_input_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE source_files ADD COLUMN last_total_cached_input_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE source_files ADD COLUMN last_total_output_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE source_files ADD COLUMN last_total_reasoning_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE source_files ADD COLUMN last_total_tokens INTEGER NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS token_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,
@@ -97,6 +113,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	}
 	for _, stmt := range statements {
 		if _, err := db.sql.ExecContext(ctx, stmt); err != nil {
+			if isDuplicateColumnError(err) {
+				continue
+			}
 			return err
 		}
 	}
@@ -104,9 +123,35 @@ func (db *DB) migrate(ctx context.Context) error {
 }
 
 func (db *DB) SourceFile(ctx context.Context, path string) (SourceFile, bool, error) {
-	row := db.sql.QueryRowContext(ctx, `SELECT path, size_bytes, mod_time_unix, processed_offset, session_id, COALESCE(started_at, ''), COALESCE(last_seen_at, '') FROM source_files WHERE path = ?`, path)
+	row := db.sql.QueryRowContext(ctx, `SELECT
+		path,
+		size_bytes,
+		mod_time_unix,
+		processed_offset,
+		session_id,
+		COALESCE(started_at, ''),
+		COALESCE(last_seen_at, ''),
+		last_total_input_tokens,
+		last_total_cached_input_tokens,
+		last_total_output_tokens,
+		last_total_reasoning_tokens,
+		last_total_tokens
+		FROM source_files WHERE path = ?`, path)
 	var sf SourceFile
-	if err := row.Scan(&sf.Path, &sf.SizeBytes, &sf.ModTimeUnix, &sf.ProcessedOffset, &sf.SessionID, &sf.StartedAt, &sf.LastSeenAt); err != nil {
+	if err := row.Scan(
+		&sf.Path,
+		&sf.SizeBytes,
+		&sf.ModTimeUnix,
+		&sf.ProcessedOffset,
+		&sf.SessionID,
+		&sf.StartedAt,
+		&sf.LastSeenAt,
+		&sf.LastTotalInputTokens,
+		&sf.LastTotalCachedInputTokens,
+		&sf.LastTotalOutputTokens,
+		&sf.LastTotalReasoningTokens,
+		&sf.LastTotalTokens,
+	); err != nil {
 		if err == sql.ErrNoRows {
 			return SourceFile{}, false, nil
 		}
@@ -156,15 +201,31 @@ func (db *DB) SaveFileSync(ctx context.Context, source SourceFile, events []Toke
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO source_files (
-		path, size_bytes, mod_time_unix, processed_offset, session_id, started_at, last_seen_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?)
+		path,
+		size_bytes,
+		mod_time_unix,
+		processed_offset,
+		session_id,
+		started_at,
+		last_seen_at,
+		last_total_input_tokens,
+		last_total_cached_input_tokens,
+		last_total_output_tokens,
+		last_total_reasoning_tokens,
+		last_total_tokens
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		size_bytes = excluded.size_bytes,
 		mod_time_unix = excluded.mod_time_unix,
 		processed_offset = excluded.processed_offset,
 		session_id = excluded.session_id,
 		started_at = COALESCE(NULLIF(source_files.started_at, ''), excluded.started_at),
-		last_seen_at = excluded.last_seen_at`,
+		last_seen_at = excluded.last_seen_at,
+		last_total_input_tokens = excluded.last_total_input_tokens,
+		last_total_cached_input_tokens = excluded.last_total_cached_input_tokens,
+		last_total_output_tokens = excluded.last_total_output_tokens,
+		last_total_reasoning_tokens = excluded.last_total_reasoning_tokens,
+		last_total_tokens = excluded.last_total_tokens`,
 		source.Path,
 		source.SizeBytes,
 		source.ModTimeUnix,
@@ -172,6 +233,11 @@ func (db *DB) SaveFileSync(ctx context.Context, source SourceFile, events []Toke
 		source.SessionID,
 		source.StartedAt,
 		source.LastSeenAt,
+		source.LastTotalInputTokens,
+		source.LastTotalCachedInputTokens,
+		source.LastTotalOutputTokens,
+		source.LastTotalReasoningTokens,
+		source.LastTotalTokens,
 	); err != nil {
 		tx.Rollback()
 		return err
@@ -209,4 +275,8 @@ func (db *DB) Events(ctx context.Context) ([]TokenEvent, error) {
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+func isDuplicateColumnError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column name")
 }

@@ -13,12 +13,15 @@ import (
 )
 
 type Totals struct {
-	InputTokens           int64   `json:"input_tokens"`
-	CachedInputTokens     int64   `json:"cached_input_tokens"`
-	OutputTokens          int64   `json:"output_tokens"`
-	ReasoningOutputTokens int64   `json:"reasoning_output_tokens"`
-	TotalTokens           int64   `json:"total_tokens"`
-	CacheHitRate          float64 `json:"cache_hit_rate"`
+	InputTokens              int64   `json:"input_tokens"`
+	CachedInputTokens        int64   `json:"cached_input_tokens"`
+	UncachedInputTokens      int64   `json:"uncached_input_tokens"`
+	CacheReadInputTokens     int64   `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int64   `json:"cache_creation_input_tokens"`
+	OutputTokens             int64   `json:"output_tokens"`
+	ReasoningOutputTokens    int64   `json:"reasoning_output_tokens"`
+	TotalTokens              int64   `json:"total_tokens"`
+	CacheHitRate             float64 `json:"cache_hit_rate"`
 }
 
 type Row struct {
@@ -83,8 +86,9 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 			return nil, err
 		}
 		return []Row{
-			{Label: "input", Totals: Totals{TotalTokens: totals.InputTokens, InputTokens: totals.InputTokens}},
-			{Label: "cached input", Totals: Totals{TotalTokens: totals.CachedInputTokens, CachedInputTokens: totals.CachedInputTokens}},
+			{Label: "uncached input", Totals: withDerived(Totals{TotalTokens: totals.InputTokens, InputTokens: totals.InputTokens})},
+			{Label: "cache read", Totals: withDerived(Totals{TotalTokens: totals.CachedInputTokens, CachedInputTokens: totals.CachedInputTokens})},
+			{Label: "cache creation", Totals: withDerived(Totals{})},
 			{Label: "output", Totals: Totals{TotalTokens: totals.OutputTokens, OutputTokens: totals.OutputTokens}},
 			{Label: "reasoning output", Totals: Totals{TotalTokens: totals.ReasoningOutputTokens, ReasoningOutputTokens: totals.ReasoningOutputTokens}},
 		}, nil
@@ -124,7 +128,7 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 		); err != nil {
 			return nil, err
 		}
-		row.Totals.CacheHitRate = cacheHitRate(row.Totals)
+		row.Totals = withDerived(row.Totals)
 		rows = append(rows, row)
 	}
 	return rows, sqlRows.Err()
@@ -157,12 +161,12 @@ func queryTotals(ctx context.Context, db *store.DB, where string, args ...any) (
 			return Totals{}, err
 		}
 	}
-	totals.CacheHitRate = cacheHitRate(totals)
-	return totals, rows.Err()
+	return withDerived(totals), rows.Err()
 }
 
 func Render(data Data, view string) string {
 	var b strings.Builder
+	data.Totals = withDerived(data.Totals)
 	fmt.Fprintf(&b, "%s\n\n", strings.ToUpper(view))
 	writeTotals(&b, data.Totals)
 	if len(data.Rows) == 0 {
@@ -180,10 +184,11 @@ func Render(data Data, view string) string {
 }
 
 func writeTotals(b *strings.Builder, totals Totals) {
-	fmt.Fprintf(b, "Total: %s  Input: %s  Cached: %s  Output: %s  Reasoning: %s  Cache hit: %.1f%%\n",
+	fmt.Fprintf(b, "Total: %s  Uncached: %s  Cache read: %s  Cache creation: %s  Output: %s  Reasoning: %s  Cache hit: %.1f%%\n",
 		formatInt(totals.TotalTokens),
-		formatInt(totals.InputTokens),
-		formatInt(totals.CachedInputTokens),
+		formatInt(totals.UncachedInputTokens),
+		formatInt(totals.CacheReadInputTokens),
+		formatInt(totals.CacheCreationInputTokens),
 		formatInt(totals.OutputTokens),
 		formatInt(totals.ReasoningOutputTokens),
 		totals.CacheHitRate*100,
@@ -191,13 +196,13 @@ func writeTotals(b *strings.Builder, totals Totals) {
 }
 
 func writeRows(b *strings.Builder, rows []Row, view string) {
-	tableRows := [][]string{{"Group", "Total", "Input", "Cached", "Output", "Reasoning", "Cache"}}
+	tableRows := [][]string{{"Group", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Hit Rate"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
 			truncate(row.Label, 36),
 			formatInt(row.Totals.TotalTokens),
-			formatInt(row.Totals.InputTokens),
-			formatInt(row.Totals.CachedInputTokens),
+			formatInt(row.Totals.UncachedInputTokens),
+			formatInt(row.Totals.CacheReadInputTokens),
 			formatInt(row.Totals.OutputTokens),
 			formatInt(row.Totals.ReasoningOutputTokens),
 			fmt.Sprintf("%.1f%%", row.Totals.CacheHitRate*100),
@@ -303,21 +308,35 @@ func writeGraph(b *strings.Builder, rows []Row, view string) {
 }
 
 func addTotals(a, b Totals) Totals {
-	return Totals{
-		InputTokens:           a.InputTokens + b.InputTokens,
-		CachedInputTokens:     a.CachedInputTokens + b.CachedInputTokens,
-		OutputTokens:          a.OutputTokens + b.OutputTokens,
-		ReasoningOutputTokens: a.ReasoningOutputTokens + b.ReasoningOutputTokens,
-		TotalTokens:           a.TotalTokens + b.TotalTokens,
-	}
+	return withDerived(Totals{
+		InputTokens:              a.InputTokens + b.InputTokens,
+		CachedInputTokens:        a.CachedInputTokens + b.CachedInputTokens,
+		UncachedInputTokens:      a.UncachedInputTokens + b.UncachedInputTokens,
+		CacheReadInputTokens:     a.CacheReadInputTokens + b.CacheReadInputTokens,
+		CacheCreationInputTokens: a.CacheCreationInputTokens + b.CacheCreationInputTokens,
+		OutputTokens:             a.OutputTokens + b.OutputTokens,
+		ReasoningOutputTokens:    a.ReasoningOutputTokens + b.ReasoningOutputTokens,
+		TotalTokens:              a.TotalTokens + b.TotalTokens,
+	})
 }
 
 func cacheHitRate(t Totals) float64 {
-	denominator := t.CachedInputTokens + t.InputTokens
+	denominator := t.CacheReadInputTokens + t.CacheCreationInputTokens + t.UncachedInputTokens
 	if denominator == 0 {
 		return 0
 	}
-	return float64(t.CachedInputTokens) / float64(denominator)
+	return float64(t.CacheReadInputTokens) / float64(denominator)
+}
+
+func withDerived(t Totals) Totals {
+	if t.UncachedInputTokens == 0 {
+		t.UncachedInputTokens = t.InputTokens
+	}
+	if t.CacheReadInputTokens == 0 {
+		t.CacheReadInputTokens = t.CachedInputTokens
+	}
+	t.CacheHitRate = cacheHitRate(t)
+	return t
 }
 
 func formatInt(n int64) string {
