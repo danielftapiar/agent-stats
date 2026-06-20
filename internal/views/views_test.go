@@ -434,10 +434,10 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 		t.Fatal("summary table header not found")
 	}
 
-	expectedHeader := []string{"Week", "Credits", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}
+	expectedHeader := []string{"Week", "Credits", "Budget", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}
 	expectedRows := [][]string{
-		{"2026-W24", "4.2K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K"},
-		{"2026-W23", "0.5", "1.2K", "1K", "200", "16.7%", "12"},
+		{"2026-W24", "4.2K", "[########------------] 4.2K/10K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K"},
+		{"2026-W23", "0.5", "[--------------------] 0.5/10K", "1.2K", "1K", "200", "16.7%", "12"},
 	}
 	columns := columnsFor(append([][]string{expectedHeader}, expectedRows...))
 	assertTableLineAligned(t, lines[headerIndex], columns, expectedHeader)

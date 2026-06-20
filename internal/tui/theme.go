@@ -20,6 +20,7 @@ type theme struct {
 	Totals      lipgloss.Style
 	TableHeader lipgloss.Style
 	Graph       lipgloss.Style
+	SelectedRow lipgloss.Style
 }
 
 func defaultTheme() theme {
@@ -78,6 +79,10 @@ func signalTheme() theme {
 			Background(lipgloss.Color("#7BDFF2")),
 		Graph: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#7BDFF2")),
+		SelectedRow: lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#101418")).
+			Background(lipgloss.Color("#F4D35E")),
 	}
 }
 
@@ -125,6 +130,10 @@ func graphiteTheme() theme {
 			Background(lipgloss.Color("#A7B0BA")),
 		Graph: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#9ED0FF")),
+		SelectedRow: lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#101418")).
+			Background(lipgloss.Color("#DCE3EA")),
 	}
 }
 
@@ -172,5 +181,9 @@ func highContrastTheme() theme {
 			Background(lipgloss.Color("#FFFFFF")),
 		Graph: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#00FFFF")),
+		SelectedRow: lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#000000")).
+			Background(lipgloss.Color("#FFFF00")),
 	}
 }

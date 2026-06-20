@@ -32,27 +32,29 @@ var viewNames = []string{
 }
 
 type model struct {
-	ctx         context.Context
-	db          *store.DB
-	indexer     *codex.Indexer
-	active      int
-	input       textinput.Model
-	viewport    viewport.Model
-	prompt      bool
-	picker      bool
-	err         string
-	data        views.Data
-	width       int
-	height      int
-	lastSync    time.Time
-	theme       theme
-	themes      []namedTheme
-	selected    int
-	preview     int
-	row         int
-	payloadRow  int
-	session     string
-	interaction string
+	ctx           context.Context
+	db            *store.DB
+	indexer       *codex.Indexer
+	active        int
+	input         textinput.Model
+	viewport      viewport.Model
+	prompt        bool
+	picker        bool
+	confirmDelete bool
+	err           string
+	data          views.Data
+	width         int
+	height        int
+	lastSync      time.Time
+	theme         theme
+	themes        []namedTheme
+	selected      int
+	preview       int
+	row           int
+	payloadRow    int
+	session       string
+	interaction   string
+	pendingDelete string
 }
 
 func Run(ctx context.Context, db *store.DB, indexer *codex.Indexer) error {
@@ -80,6 +82,7 @@ func newModel(ctx context.Context, db *store.DB, indexer *codex.Indexer) model {
 		theme:    t,
 		themes:   themes,
 	}
+	m.viewport.SetHorizontalStep(8)
 	m.reload()
 	return m
 }
@@ -106,6 +109,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tick()
 	case tea.KeyMsg:
+		if m.confirmDelete {
+			return m.updateDeleteConfirm(msg)
+		}
 		if m.picker {
 			return m.updateThemePicker(msg)
 		}
@@ -155,9 +161,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
-				m.deleteSelectedSession()
+				m.startDeleteConfirmation()
 				return m, nil
 			}
+		case "l":
+			m.viewport.ScrollRight(8)
+			return m, nil
+		case "h":
+			m.viewport.ScrollLeft(8)
+			return m, nil
 		case "j", "down":
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
 				m.row++
@@ -265,6 +277,29 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) updateDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.cancelDeleteConfirmation()
+		return m, nil
+	case "enter":
+		value := strings.TrimSpace(strings.ToLower(m.input.Value()))
+		sessionID := m.pendingDelete
+		m.cancelDeleteConfirmation()
+		if value == "yes" {
+			m.deleteSession(sessionID)
+		} else {
+			m.err = fmt.Sprintf("delete cancelled for %s", sessionID)
+		}
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
 func commandHelp() string {
 	return "commands: :summary :today :daily :sessions :cache :reasoning :commands :payload :tokens :top :theme :quit"
 }
@@ -352,6 +387,7 @@ func (m *model) configureViewport() {
 	}
 	m.viewport.Width = contentWidth
 	m.viewport.Height = contentHeight
+	m.viewport.SetHorizontalStep(8)
 }
 
 func (m *model) setViewportContent() {
@@ -381,10 +417,12 @@ func (m model) View() string {
 	}
 	if m.picker {
 		b.WriteString(m.renderThemePicker())
+	} else if m.confirmDelete {
+		b.WriteString(m.input.View())
 	} else if m.prompt {
 		b.WriteString(m.input.View())
 	} else {
-		b.WriteString(m.theme.Help.Render("Press : for commands, :theme for themes, arrows/PageUp/PageDown to scroll, q to quit"))
+		b.WriteString(m.theme.Help.Render("Press : for commands, :theme for themes, h/l or arrows to scroll, q to quit"))
 	}
 	return m.theme.Frame.Render(b.String())
 }
@@ -412,12 +450,22 @@ func (m model) themeContent(content string) string {
 		case isTableHeader(line):
 			lines[i] = m.theme.TableHeader.Render(line)
 		case isSelectedLine(line):
-			lines[i] = m.theme.ActiveTab.Width(lipgloss.Width(line)).Render(line)
+			lines[i] = m.theme.SelectedRow.Width(m.contentWidth()).Render(line)
 		case strings.ContainsAny(line, "┤┼╭╮╯╰─│"):
 			lines[i] = m.theme.Graph.Render(line)
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m model) contentWidth() int {
+	if m.viewport.Width > 0 {
+		return m.viewport.Width
+	}
+	if m.width > frameHorizontalSize {
+		return m.width - frameHorizontalSize
+	}
+	return 80
 }
 
 func (m model) inSessionPayload() bool {
@@ -433,7 +481,7 @@ func (m *model) clampPayloadRow() {
 	}
 }
 
-func (m *model) deleteSelectedSession() {
+func (m *model) startDeleteConfirmation() {
 	if len(m.data.Rows) == 0 {
 		return
 	}
@@ -444,6 +492,24 @@ func (m *model) deleteSelectedSession() {
 		m.row = len(m.data.Rows) - 1
 	}
 	sessionID := strings.TrimPrefix(m.data.Rows[m.row].Label, "> ")
+	m.pendingDelete = sessionID
+	m.confirmDelete = true
+	m.input.Focus()
+	m.input.SetValue("")
+	m.input.Prompt = fmt.Sprintf("delete %s? type yes: ", sessionID)
+	m.err = ""
+}
+
+func (m *model) cancelDeleteConfirmation() {
+	m.confirmDelete = false
+	m.pendingDelete = ""
+	m.input.SetValue("")
+	m.input.Blur()
+	m.input.Prompt = ":"
+	m.applyThemeToInput()
+}
+
+func (m *model) deleteSession(sessionID string) {
 	paths, err := m.db.SessionSourcePaths(m.ctx, sessionID)
 	if err != nil {
 		m.err = err.Error()

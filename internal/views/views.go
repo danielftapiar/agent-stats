@@ -745,13 +745,12 @@ func writeWeeklySummary(b *strings.Builder, rows []Row) {
 		calls += row.FunctionCalls
 	}
 	fmt.Fprintf(b, "Weekly credits: %s  Function calls: %s\n\n", formatCredits(credits), formatInt(calls))
-	writeCreditsGraph(b, rows)
-	b.WriteString("\n")
-	tableRows := [][]string{{"Week", "Credits", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}}
+	tableRows := [][]string{{"Week", "Credits", "Budget", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}}
 	for _, row := range rows {
 		tableRows = append(tableRows, []string{
 			row.Label,
 			formatCredits(row.Totals.Credits),
+			progressBar(row.Totals.Credits, weeklyCreditBudget, 20),
 			formatInt(row.Totals.TotalTokens),
 			formatInt(row.Totals.UncachedInputTokens),
 			formatInt(row.Totals.CacheReadInputTokens),
@@ -988,6 +987,8 @@ func tableColumnFor(header string) tableColumn {
 		return tableColumn{width: 8, align: alignCenter}
 	case "Credits":
 		return tableColumn{width: 10, align: alignCenter}
+	case "Budget":
+		return tableColumn{width: 32, align: alignCenter}
 	case "Payload Bytes":
 		return tableColumn{width: 13, align: alignCenter}
 	case "Payload Total", "Avg Bytes", "Max Bytes":
@@ -1056,24 +1057,6 @@ func writeGraph(b *strings.Builder, rows []Row, view string) {
 	b.WriteString("\n")
 }
 
-func writeCreditsGraph(b *strings.Builder, rows []Row) {
-	if len(rows) == 0 {
-		return
-	}
-	values := make([]float64, 0, len(rows))
-	labels := make([]string, 0, len(rows))
-	for i := len(rows) - 1; i >= 0; i-- {
-		values = append(values, rows[i].Totals.Credits)
-		labels = append(labels, rows[i].Label)
-	}
-	b.WriteString(asciigraph.Plot(values, asciigraph.Height(8), asciigraph.YAxisValueFormatter(func(value float64) string {
-		return formatCredits(value)
-	})))
-	b.WriteString("\nWeeks: ")
-	b.WriteString(strings.Join(labels, " "))
-	b.WriteString("\n")
-}
-
 func graphValueFormatter(view string) func(float64) string {
 	return func(value float64) string {
 		if view == "cache" {
@@ -1081,6 +1064,30 @@ func graphValueFormatter(view string) func(float64) string {
 		}
 		return formatCompactFloat(value)
 	}
+}
+
+const weeklyCreditBudget = 10_000
+
+func progressBar(value, max float64, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if max <= 0 {
+		max = 1
+	}
+	ratio := value / max
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	filled := int(math.Round(ratio * float64(width)))
+	if filled > width {
+		filled = width
+	}
+	empty := width - filled
+	return fmt.Sprintf("[%s%s] %s/%s", strings.Repeat("#", filled), strings.Repeat("-", empty), formatCredits(value), formatCredits(max))
 }
 
 func addTotals(a, b Totals) Totals {

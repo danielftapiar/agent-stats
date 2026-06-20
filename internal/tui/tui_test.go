@@ -1,13 +1,17 @@
 package tui
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/danieltapia/agent-stats/internal/store"
 	"github.com/danieltapia/agent-stats/internal/views"
 )
 
@@ -41,10 +45,97 @@ func TestThemeRendersVisibleFrameAndContentAccents(t *testing.T) {
 	m.setViewportContent()
 
 	rendered := m.View()
-	for _, want := range []string{"agent-stats", "SUMMARY", "Weekly credits:", "Week", "┃"} {
+	for _, want := range []string{"agent-stats", "SUMMARY", "Weekly credits:", "Week", "Budget"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected themed view to contain %q, got:\n%s", want, rendered)
 		}
+	}
+}
+
+func TestVimKeysScrollHorizontally(t *testing.T) {
+	m := newTestModel(views.Data{
+		View: "sessions",
+		Rows: []views.Row{{
+			Label:     "session-with-a-long-visible-row",
+			Directory: "/Users/example/some/really/long/project/path",
+			Model:     "gpt-5.5-codex",
+			Totals:    views.Totals{InputTokens: 1000, TotalTokens: 1000},
+		}},
+	})
+	m.active = viewIndex("sessions")
+	m.viewport = viewport.New(24, 8)
+	m.viewport.SetHorizontalStep(8)
+	m.setViewportContent()
+	before := m.viewport.View()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(model)
+	afterRight := m.viewport.View()
+	if before == afterRight {
+		t.Fatal("expected l to scroll the viewport horizontally")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m = updated.(model)
+	afterLeft := m.viewport.View()
+	if afterLeft != before {
+		t.Fatal("expected h to scroll the viewport back left")
+	}
+}
+
+func TestDeleteSessionRequiresTypingYes(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	sessionPath := filepath.Join(t.TempDir(), "rollout-session-a.jsonl")
+	if err := os.WriteFile(sessionPath, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveFileSync(ctx, store.SourceFile{
+		Path:            sessionPath,
+		SizeBytes:       3,
+		ModTimeUnix:     1,
+		ProcessedOffset: 3,
+		SessionID:       "session-a",
+	}, []store.TokenEvent{{SessionID: "session-a", SourcePath: sessionPath, Timestamp: "2026-06-20T10:00:00Z", InputTokens: 1, TotalTokens: 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestModel(views.Data{View: "sessions", Rows: []views.Row{{Label: "session-a"}}})
+	m.ctx = ctx
+	m.db = db
+	m.active = viewIndex("sessions")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(model)
+	if !m.confirmDelete {
+		t.Fatal("expected d to ask for delete confirmation")
+	}
+	if _, err := os.Stat(sessionPath); err != nil {
+		t.Fatalf("expected session file to remain before confirmation: %v", err)
+	}
+
+	m.input.SetValue("no")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if m.confirmDelete {
+		t.Fatal("expected non-yes confirmation to close prompt")
+	}
+	if _, err := os.Stat(sessionPath); err != nil {
+		t.Fatalf("expected session file to remain after non-yes confirmation: %v", err)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(model)
+	m.input.SetValue("yes")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if _, err := os.Stat(sessionPath); !os.IsNotExist(err) {
+		t.Fatalf("expected session file to be deleted after typing yes, got err=%v", err)
 	}
 }
 
