@@ -175,6 +175,52 @@ func TestLoadSummaryGroupsWeeklyCreditsAndFunctionCalls(t *testing.T) {
 	}
 }
 
+func TestLoadSummaryWeekGroupsDaysWithGraph(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	source := store.SourceFile{
+		Path:            "source.jsonl",
+		SizeBytes:       10,
+		ModTimeUnix:     1,
+		ProcessedOffset: 10,
+		SessionID:       "session-a",
+		Model:           "gpt-5.5",
+	}
+	events := []store.TokenEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-18T10:00:00Z", InputTokens: 1_000_000, CachedInputTokens: 900_000, OutputTokens: 10_000, TotalTokens: 1_010_000, Model: "gpt-5.5"},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-19T10:00:00Z", InputTokens: 2_000_000, CachedInputTokens: 1_500_000, OutputTokens: 20_000, TotalTokens: 2_020_000, Model: "gpt-5.5"},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-25T10:00:00Z", InputTokens: 9_000_000, CachedInputTokens: 8_000_000, OutputTokens: 90_000, TotalTokens: 9_090_000, Model: "gpt-5.5"},
+	}
+	commands := []store.CommandEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-18T10:00:00Z", EventType: "function_call", CommandName: "exec_command"},
+	}
+	if err := db.SaveFileSyncWithDetails(ctx, source, events, commands, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := LoadSummaryWeek(ctx, db, "2026-05-18")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Period != "day" || data.PeriodStart != "2026-05-18" {
+		t.Fatalf("expected day summary for 2026-05-18, got period=%q start=%q", data.Period, data.PeriodStart)
+	}
+	if len(data.Rows) != 2 {
+		t.Fatalf("expected 2 day rows in selected week, got %d", len(data.Rows))
+	}
+	rendered := Render(data, "summary")
+	for _, want := range []string{"Week 2026 May 18th daily credits", "Days:", "Day", "2026 May 19th", "2026 May 18th"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected weekly drilldown summary to contain %q:\n%s", want, rendered)
+		}
+	}
+}
+
 func TestLoadSessionsIncludesDirectoryAndFunctionCalls(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
@@ -453,7 +499,7 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 
 	rendered := strings.Join(lines, "\n")
 	for _, want := range []string{
-		"Week", "Credits", "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls",
+		"Week", "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls",
 		"Weeks: 2026 May 11th 2026 May 18th",
 		"2026 May 18th", "████████░░░░░░░░░░░░ 4.2K/10K", "1.74B", "76.8M", "1.66B", "95.6%", "1.23K",
 		"2026 May 11th", "░░░░░░░░░░░░░░░░░░░░ 0.5/10K", "1.2K",
@@ -461,6 +507,9 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected rendered summary to contain %q:\n%s", want, rendered)
 		}
+	}
+	if strings.Contains(rendered, "Week             Credits") {
+		t.Fatalf("expected summary table to omit standalone Credits column:\n%s", rendered)
 	}
 	if strings.Contains(rendered, "#") {
 		t.Fatalf("expected summary progress bars to use rendered block glyphs, got:\n%s", rendered)

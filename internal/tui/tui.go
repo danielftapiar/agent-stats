@@ -50,10 +50,12 @@ type model struct {
 	themes        []namedTheme
 	selected      int
 	preview       int
+	summaryRow    int
 	row           int
 	payloadRow    int
 	session       string
 	interaction   string
+	summaryWeek   string
 	pendingDelete string
 }
 
@@ -130,6 +132,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = commandHelp()
 			return m, nil
 		case "enter":
+			if viewNames[m.active] == "summary" && m.summaryWeek == "" && len(m.data.Rows) > 0 {
+				m.clampSummaryRow()
+				m.summaryWeek = m.data.Rows[m.summaryRow].PeriodStart
+				m.reload()
+				return m, nil
+			}
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
 				if m.row < 0 {
 					m.row = 0
@@ -154,6 +162,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "esc", "backspace":
+			if viewNames[m.active] == "summary" && m.summaryWeek != "" {
+				m.summaryWeek = ""
+				m.reload()
+				return m, nil
+			}
 			if viewNames[m.active] == "payload" && m.interaction != "" {
 				m.interaction = ""
 				m.reload()
@@ -171,6 +184,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.ScrollLeft(8)
 			return m, nil
 		case "j", "down":
+			if viewNames[m.active] == "summary" && m.summaryWeek == "" && len(m.data.Rows) > 0 {
+				m.summaryRow++
+				m.clampSummaryRow()
+				m.setViewportContent()
+				return m, nil
+			}
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
 				m.row++
 				if m.row >= len(m.data.Rows) {
@@ -186,6 +205,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "k", "up":
+			if viewNames[m.active] == "summary" && m.summaryWeek == "" && len(m.data.Rows) > 0 {
+				m.summaryRow--
+				m.clampSummaryRow()
+				m.setViewportContent()
+				return m, nil
+			}
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
 				m.row--
 				if m.row < 0 {
@@ -204,6 +229,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.active = (m.active + 1) % len(viewNames)
 			m.session = ""
 			m.interaction = ""
+			m.summaryWeek = ""
 			m.reload()
 			return m, nil
 		case "shift+tab":
@@ -213,6 +239,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.session = ""
 			m.interaction = ""
+			m.summaryWeek = ""
 			m.reload()
 			return m, nil
 		}
@@ -224,6 +251,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.active = next
 					m.session = ""
 					m.interaction = ""
+					m.summaryWeek = ""
 					m.reload()
 				}
 			}
@@ -262,6 +290,9 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if value != "payload" {
 				m.session = ""
 				m.interaction = ""
+			}
+			if value != "summary" {
+				m.summaryWeek = ""
 			}
 			m.err = ""
 			m.reload()
@@ -341,7 +372,9 @@ func (m *model) reload() {
 		data views.Data
 		err  error
 	)
-	if viewNames[m.active] == "payload" && m.session != "" {
+	if viewNames[m.active] == "summary" && m.summaryWeek != "" {
+		data, err = views.LoadSummaryWeek(m.ctx, m.db, m.summaryWeek)
+	} else if viewNames[m.active] == "payload" && m.session != "" {
 		if m.interaction != "" {
 			data, err = views.LoadPayloadInteraction(m.ctx, m.db, m.session, m.interaction)
 		} else {
@@ -362,6 +395,15 @@ func (m *model) reload() {
 			m.row = 0
 		}
 		data.SelectedIndex = m.row
+	}
+	if viewNames[m.active] == "summary" && m.summaryWeek == "" {
+		if m.summaryRow >= len(data.Rows) {
+			m.summaryRow = len(data.Rows) - 1
+		}
+		if m.summaryRow < 0 {
+			m.summaryRow = 0
+		}
+		data.SelectedIndex = m.summaryRow
 	}
 	if m.inSessionPayload() && m.interaction == "" {
 		if m.payloadRow >= len(data.Rows) {
@@ -431,6 +473,9 @@ func (m model) renderContent() string {
 	if viewNames[m.active] == "sessions" {
 		m.data.SelectedIndex = m.row
 	}
+	if viewNames[m.active] == "summary" && m.summaryWeek == "" {
+		m.data.SelectedIndex = m.summaryRow
+	}
 	if m.inSessionPayload() && m.interaction == "" {
 		m.data.SelectedIndex = m.payloadRow
 	}
@@ -478,6 +523,15 @@ func (m model) contentWidth() int {
 
 func (m model) inSessionPayload() bool {
 	return viewNames[m.active] == "payload" && m.session != ""
+}
+
+func (m *model) clampSummaryRow() {
+	if m.summaryRow >= len(m.data.Rows) {
+		m.summaryRow = len(m.data.Rows) - 1
+	}
+	if m.summaryRow < 0 {
+		m.summaryRow = 0
+	}
 }
 
 func (m *model) clampPayloadRow() {
@@ -540,7 +594,7 @@ func (m *model) deleteSession(sessionID string) {
 }
 
 func isTableHeader(line string) bool {
-	for _, prefix := range []string{"Group", "Week", "Command", "Payload", "Metric", "Interaction"} {
+	for _, prefix := range []string{"Group", "Week", "Day", "Command", "Payload", "Metric", "Interaction"} {
 		if strings.HasPrefix(line, prefix) {
 			return true
 		}

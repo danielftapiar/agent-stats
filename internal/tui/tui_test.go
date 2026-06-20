@@ -17,6 +17,7 @@ import (
 
 func TestSmallWindowUsesScrollableViewport(t *testing.T) {
 	m := newTestModel(manyRowsData(40))
+	m.active = viewIndex("daily")
 	m.configureViewport()
 	m.setViewportContent()
 
@@ -80,6 +81,58 @@ func TestVimKeysScrollHorizontally(t *testing.T) {
 	afterLeft := m.viewport.View()
 	if afterLeft != before {
 		t.Fatal("expected h to scroll the viewport back left")
+	}
+}
+
+func TestSummaryVimSelectionDrillsIntoSelectedWeek(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SaveFileSync(ctx, store.SourceFile{
+		Path:            "source.jsonl",
+		SizeBytes:       10,
+		ModTimeUnix:     1,
+		ProcessedOffset: 10,
+		SessionID:       "session-a",
+		Model:           "gpt-5.5",
+	}, []store.TokenEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-18T10:00:00Z", InputTokens: 1_000_000, CachedInputTokens: 900_000, OutputTokens: 10_000, TotalTokens: 1_010_000, Model: "gpt-5.5"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestModel(views.Data{
+		View: "summary",
+		Rows: []views.Row{
+			{Label: "2026 May 25th", PeriodStart: "2026-05-25"},
+			{Label: "2026 May 18th", PeriodStart: "2026-05-18"},
+		},
+	})
+	m.ctx = ctx
+	m.db = db
+	m.active = viewIndex("summary")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(model)
+	if m.summaryRow != 1 {
+		t.Fatalf("expected j to select second summary row, got %d", m.summaryRow)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if m.summaryWeek != "2026-05-18" {
+		t.Fatalf("expected enter to drill into selected week, got %q", m.summaryWeek)
+	}
+	if m.data.Period != "day" {
+		t.Fatalf("expected day drilldown data, got period %q", m.data.Period)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(model)
+	if m.summaryWeek != "" {
+		t.Fatalf("expected escape to return to weekly summary, got %q", m.summaryWeek)
 	}
 }
 
