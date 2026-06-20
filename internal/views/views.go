@@ -3,6 +3,7 @@ package views
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -190,18 +191,96 @@ func writeTotals(b *strings.Builder, totals Totals) {
 }
 
 func writeRows(b *strings.Builder, rows []Row, view string) {
-	fmt.Fprintf(b, "%-36s %12s %12s %12s %12s %12s %10s\n", "Group", "Total", "Input", "Cached", "Output", "Reasoning", "Cache")
+	tableRows := [][]string{{"Group", "Total", "Input", "Cached", "Output", "Reasoning", "Cache"}}
 	for _, row := range rows {
-		fmt.Fprintf(b, "%-36s %12s %12s %12s %12s %12s %9.1f%%\n",
+		tableRows = append(tableRows, []string{
 			truncate(row.Label, 36),
 			formatInt(row.Totals.TotalTokens),
 			formatInt(row.Totals.InputTokens),
 			formatInt(row.Totals.CachedInputTokens),
 			formatInt(row.Totals.OutputTokens),
 			formatInt(row.Totals.ReasoningOutputTokens),
-			row.Totals.CacheHitRate*100,
-		)
+			fmt.Sprintf("%.1f%%", row.Totals.CacheHitRate*100),
+		})
 	}
+	columns := columnsFor(tableRows)
+	for _, row := range tableRows {
+		writeTableLine(b, columns, row)
+	}
+}
+
+type tableColumn struct {
+	width int
+	align alignment
+}
+
+type alignment int
+
+const (
+	alignLeft alignment = iota
+	alignCenter
+)
+
+var baseTableColumns = []tableColumn{
+	{width: 36, align: alignLeft},
+	{width: 12, align: alignCenter},
+	{width: 12, align: alignCenter},
+	{width: 12, align: alignCenter},
+	{width: 12, align: alignCenter},
+	{width: 12, align: alignCenter},
+	{width: 10, align: alignCenter},
+}
+
+func columnsFor(rows [][]string) []tableColumn {
+	columns := make([]tableColumn, len(baseTableColumns))
+	copy(columns, baseTableColumns)
+	for _, row := range rows {
+		for i, value := range row {
+			if i >= len(columns) {
+				continue
+			}
+			if len(value) > columns[i].width {
+				columns[i].width = len(value)
+			}
+		}
+	}
+	return columns
+}
+
+func writeTableLine(b *strings.Builder, columns []tableColumn, values []string) {
+	for i, col := range columns {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		value := ""
+		if i < len(values) {
+			value = values[i]
+		}
+		switch col.align {
+		case alignCenter:
+			b.WriteString(center(value, col.width))
+		default:
+			b.WriteString(padRight(value, col.width))
+		}
+	}
+	b.WriteByte('\n')
+}
+
+func center(value string, width int) string {
+	if len(value) >= width {
+		return value
+	}
+	padding := width - len(value)
+	left := padding / 2
+	right := padding - left
+	return strings.Repeat(" ", left) + value + strings.Repeat(" ", right)
+}
+
+func padRight(value string, width int) string {
+	if len(value) >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-len(value))
 }
 
 func writeGraph(b *strings.Builder, rows []Row, view string) {
@@ -242,17 +321,38 @@ func cacheHitRate(t Totals) float64 {
 }
 
 func formatInt(n int64) string {
-	s := fmt.Sprintf("%d", n)
-	if len(s) <= 3 {
-		return s
+	if n < 0 {
+		return "-" + formatInt(-n)
 	}
-	var parts []string
-	for len(s) > 3 {
-		parts = append([]string{s[len(s)-3:]}, parts...)
-		s = s[:len(s)-3]
+	units := []struct {
+		value  float64
+		suffix string
+	}{
+		{value: 1_000_000_000_000, suffix: "T"},
+		{value: 1_000_000_000, suffix: "B"},
+		{value: 1_000_000, suffix: "M"},
+		{value: 1_000, suffix: "K"},
 	}
-	parts = append([]string{s}, parts...)
-	return strings.Join(parts, ",")
+	for _, unit := range units {
+		if float64(n) >= unit.value {
+			return trimCompactFloat(float64(n)/unit.value) + unit.suffix
+		}
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+func trimCompactFloat(value float64) string {
+	var rendered string
+	switch {
+	case value < 10:
+		rendered = fmt.Sprintf("%.2f", value)
+	case value < 100:
+		rendered = fmt.Sprintf("%.1f", value)
+	default:
+		rendered = fmt.Sprintf("%.0f", math.Round(value))
+	}
+	rendered = strings.TrimRight(rendered, "0")
+	return strings.TrimRight(rendered, ".")
 }
 
 func truncate(s string, width int) string {
