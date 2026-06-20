@@ -25,8 +25,14 @@ type Totals struct {
 }
 
 type Row struct {
-	Label  string `json:"label"`
-	Totals Totals `json:"totals"`
+	Label         string `json:"label"`
+	Directory     string `json:"directory,omitempty"`
+	EventType     string `json:"event_type,omitempty"`
+	FunctionCalls int64  `json:"function_calls,omitempty"`
+	SessionCount  int64  `json:"session_count,omitempty"`
+	FirstSeen     string `json:"first_seen,omitempty"`
+	LastSeen      string `json:"last_seen,omitempty"`
+	Totals        Totals `json:"totals"`
 }
 
 type Data struct {
@@ -65,6 +71,8 @@ func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Ti
 		rows, err = queryReasoning(ctx, db, "substr(timestamp, 1, 10)")
 	case "top":
 		rows, err = queryGrouped(ctx, db, "session_id", "", limitOrDefault(limit))
+	case "commands":
+		rows, err = queryCommands(ctx, db, limitOrDefault(limit))
 	default:
 		rows, err = queryGrouped(ctx, db, "substr(timestamp, 1, 10)", "", 0)
 	}
@@ -77,6 +85,48 @@ func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Ti
 	}
 	data.Totals.CacheHitRate = cacheHitRate(data.Totals)
 	return data, nil
+}
+
+func queryCommands(ctx context.Context, db *store.DB, limit int) ([]Row, error) {
+	query := `SELECT command_name,
+		MAX(event_type),
+		COUNT(*),
+		COUNT(DISTINCT session_id),
+		COUNT(DISTINCT NULLIF(session_dir, '')),
+		MIN(timestamp),
+		MAX(timestamp)
+		FROM command_events
+		GROUP BY command_name
+		ORDER BY COUNT(*) DESC, command_name ASC`
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+
+	sqlRows, err := db.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+
+	var rows []Row
+	for sqlRows.Next() {
+		var row Row
+		var directoryCount int64
+		if err := sqlRows.Scan(
+			&row.Label,
+			&row.EventType,
+			&row.FunctionCalls,
+			&row.SessionCount,
+			&directoryCount,
+			&row.FirstSeen,
+			&row.LastSeen,
+		); err != nil {
+			return nil, err
+		}
+		row.Directory = fmt.Sprintf("%d dirs", directoryCount)
+		rows = append(rows, row)
+	}
+	return rows, sqlRows.Err()
 }
 
 func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, limit int, args ...any) ([]Row, error) {
@@ -98,10 +148,27 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 		SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
 		SUM(reasoning_output_tokens), SUM(total_tokens)
 		FROM token_events`, groupExpr)
+	if groupExpr == "session_id" {
+		query = `WITH source_meta AS (
+			SELECT session_id, MAX(session_dir) AS session_dir, SUM(function_call_count) AS function_call_count
+			FROM source_files
+			GROUP BY session_id
+		)
+		SELECT token_events.session_id AS label,
+		SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
+		SUM(reasoning_output_tokens), SUM(total_tokens),
+		COALESCE(source_meta.session_dir, ''), COALESCE(source_meta.function_call_count, 0)
+		FROM token_events
+		LEFT JOIN source_meta ON source_meta.session_id = token_events.session_id`
+	}
 	if where != "" {
 		query += " WHERE " + where
 	}
-	query += " GROUP BY label ORDER BY SUM(total_tokens) DESC"
+	query += " GROUP BY label"
+	if groupExpr == "session_id" {
+		query += ", source_meta.session_dir, source_meta.function_call_count"
+	}
+	query += " ORDER BY SUM(total_tokens) DESC"
 	if groupExpr == "substr(timestamp, 1, 10)" || strings.Contains(groupExpr, "12, 2") {
 		query = strings.Replace(query, "ORDER BY SUM(total_tokens) DESC", "ORDER BY label ASC", 1)
 	}
@@ -118,15 +185,30 @@ func queryGrouped(ctx context.Context, db *store.DB, groupExpr, where string, li
 	var rows []Row
 	for sqlRows.Next() {
 		var row Row
-		if err := sqlRows.Scan(
-			&row.Label,
-			&row.Totals.InputTokens,
-			&row.Totals.CachedInputTokens,
-			&row.Totals.OutputTokens,
-			&row.Totals.ReasoningOutputTokens,
-			&row.Totals.TotalTokens,
-		); err != nil {
-			return nil, err
+		if groupExpr == "session_id" {
+			if err := sqlRows.Scan(
+				&row.Label,
+				&row.Totals.InputTokens,
+				&row.Totals.CachedInputTokens,
+				&row.Totals.OutputTokens,
+				&row.Totals.ReasoningOutputTokens,
+				&row.Totals.TotalTokens,
+				&row.Directory,
+				&row.FunctionCalls,
+			); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := sqlRows.Scan(
+				&row.Label,
+				&row.Totals.InputTokens,
+				&row.Totals.CachedInputTokens,
+				&row.Totals.OutputTokens,
+				&row.Totals.ReasoningOutputTokens,
+				&row.Totals.TotalTokens,
+			); err != nil {
+				return nil, err
+			}
 		}
 		row.Totals = withDerived(row.Totals)
 		rows = append(rows, row)
@@ -139,10 +221,44 @@ func queryReasoning(ctx context.Context, db *store.DB, groupExpr string) ([]Row,
 	if err != nil {
 		return nil, err
 	}
+	if err := attachFunctionCallsByDate(ctx, db, rows); err != nil {
+		return nil, err
+	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		return rows[i].Label < rows[j].Label
 	})
 	return rows, nil
+}
+
+func attachFunctionCallsByDate(ctx context.Context, db *store.DB, rows []Row) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	byDate := make(map[string]int64, len(rows))
+	sqlRows, err := db.Query(ctx, `SELECT substr(COALESCE(NULLIF(last_seen_at, ''), started_at), 1, 10) AS label,
+		COALESCE(SUM(function_call_count), 0)
+		FROM source_files
+		WHERE COALESCE(NULLIF(last_seen_at, ''), started_at) != ''
+		GROUP BY label`)
+	if err != nil {
+		return err
+	}
+	defer sqlRows.Close()
+	for sqlRows.Next() {
+		var label string
+		var calls int64
+		if err := sqlRows.Scan(&label, &calls); err != nil {
+			return err
+		}
+		byDate[label] = calls
+	}
+	if err := sqlRows.Err(); err != nil {
+		return err
+	}
+	for i := range rows {
+		rows[i].FunctionCalls = byDate[rows[i].Label]
+	}
+	return nil
 }
 
 func queryTotals(ctx context.Context, db *store.DB, where string, args ...any) (Totals, error) {
@@ -168,6 +284,16 @@ func Render(data Data, view string) string {
 	var b strings.Builder
 	data.Totals = withDerived(data.Totals)
 	fmt.Fprintf(&b, "%s\n\n", strings.ToUpper(view))
+	if view == "commands" {
+		writeCommandSummary(&b, data.Rows)
+		if len(data.Rows) == 0 {
+			b.WriteString("\nNo command events found.\n")
+			return b.String()
+		}
+		b.WriteString("\n")
+		writeCommandRows(&b, data.Rows)
+		return b.String()
+	}
 	writeTotals(&b, data.Totals)
 	if len(data.Rows) == 0 {
 		b.WriteString("\nNo token events found.\n")
@@ -183,6 +309,34 @@ func Render(data Data, view string) string {
 	return b.String()
 }
 
+func writeCommandSummary(b *strings.Builder, rows []Row) {
+	var calls, sessions int64
+	for _, row := range rows {
+		calls += row.FunctionCalls
+		sessions += row.SessionCount
+	}
+	fmt.Fprintf(b, "Commands: %d  Calls: %s  Session refs: %s\n", len(rows), formatInt(calls), formatInt(sessions))
+}
+
+func writeCommandRows(b *strings.Builder, rows []Row) {
+	tableRows := [][]string{{"Command", "Kind", "Calls", "Sessions", "Directories", "First Seen", "Last Seen"}}
+	for _, row := range rows {
+		tableRows = append(tableRows, []string{
+			truncate(row.Label, 28),
+			truncate(row.EventType, 14),
+			formatInt(row.FunctionCalls),
+			formatInt(row.SessionCount),
+			row.Directory,
+			compactTime(row.FirstSeen),
+			compactTime(row.LastSeen),
+		})
+	}
+	columns := columnsFor(tableRows)
+	for _, row := range tableRows {
+		writeTableLine(b, columns, row)
+	}
+}
+
 func writeTotals(b *strings.Builder, totals Totals) {
 	fmt.Fprintf(b, "Total: %s  Uncached: %s  Cache read: %s  Cache creation: %s  Output: %s  Reasoning: %s  Cache hit: %.1f%%\n",
 		formatInt(totals.TotalTokens),
@@ -196,17 +350,34 @@ func writeTotals(b *strings.Builder, totals Totals) {
 }
 
 func writeRows(b *strings.Builder, rows []Row, view string) {
-	tableRows := [][]string{{"Group", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Hit Rate"}}
+	includeDirectory := hasDirectory(rows)
+	includeCalls := view == "sessions" || view == "reasoning" || hasFunctionCalls(rows)
+	headers := []string{"Group"}
+	if includeDirectory {
+		headers = append(headers, "Directory")
+	}
+	if includeCalls {
+		headers = append(headers, "Calls")
+	}
+	headers = append(headers, "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Hit Rate")
+	tableRows := [][]string{headers}
 	for _, row := range rows {
-		tableRows = append(tableRows, []string{
-			truncate(row.Label, 36),
+		values := []string{truncate(row.Label, 36)}
+		if includeDirectory {
+			values = append(values, truncate(row.Directory, 32))
+		}
+		if includeCalls {
+			values = append(values, formatInt(row.FunctionCalls))
+		}
+		values = append(values,
 			formatInt(row.Totals.TotalTokens),
 			formatInt(row.Totals.UncachedInputTokens),
 			formatInt(row.Totals.CacheReadInputTokens),
 			formatInt(row.Totals.OutputTokens),
 			formatInt(row.Totals.ReasoningOutputTokens),
 			fmt.Sprintf("%.1f%%", row.Totals.CacheHitRate*100),
-		})
+		)
+		tableRows = append(tableRows, values)
 	}
 	columns := columnsFor(tableRows)
 	for _, row := range tableRows {
@@ -226,19 +397,14 @@ const (
 	alignCenter
 )
 
-var baseTableColumns = []tableColumn{
-	{width: 36, align: alignLeft},
-	{width: 12, align: alignCenter},
-	{width: 12, align: alignCenter},
-	{width: 12, align: alignCenter},
-	{width: 12, align: alignCenter},
-	{width: 12, align: alignCenter},
-	{width: 10, align: alignCenter},
-}
-
 func columnsFor(rows [][]string) []tableColumn {
-	columns := make([]tableColumn, len(baseTableColumns))
-	copy(columns, baseTableColumns)
+	if len(rows) == 0 {
+		return nil
+	}
+	columns := make([]tableColumn, len(rows[0]))
+	for i, header := range rows[0] {
+		columns[i] = tableColumnFor(header)
+	}
 	for _, row := range rows {
 		for i, value := range row {
 			if i >= len(columns) {
@@ -250,6 +416,31 @@ func columnsFor(rows [][]string) []tableColumn {
 		}
 	}
 	return columns
+}
+
+func tableColumnFor(header string) tableColumn {
+	switch header {
+	case "Command":
+		return tableColumn{width: 28, align: alignLeft}
+	case "Kind":
+		return tableColumn{width: 14, align: alignCenter}
+	case "Group":
+		return tableColumn{width: 36, align: alignLeft}
+	case "Directory":
+		return tableColumn{width: 32, align: alignLeft}
+	case "Directories":
+		return tableColumn{width: 12, align: alignCenter}
+	case "Sessions":
+		return tableColumn{width: 10, align: alignCenter}
+	case "First Seen", "Last Seen":
+		return tableColumn{width: 16, align: alignCenter}
+	case "Calls":
+		return tableColumn{width: 8, align: alignCenter}
+	case "Hit Rate":
+		return tableColumn{width: 10, align: alignCenter}
+	default:
+		return tableColumn{width: 12, align: alignCenter}
+	}
 }
 
 func writeTableLine(b *strings.Builder, columns []tableColumn, values []string) {
@@ -303,8 +494,17 @@ func writeGraph(b *strings.Builder, rows []Row, view string) {
 	if len(values) == 0 {
 		return
 	}
-	b.WriteString(asciigraph.Plot(values, asciigraph.Height(8)))
+	b.WriteString(asciigraph.Plot(values, asciigraph.Height(8), asciigraph.YAxisValueFormatter(graphValueFormatter(view))))
 	b.WriteString("\n")
+}
+
+func graphValueFormatter(view string) func(float64) string {
+	return func(value float64) string {
+		if view == "cache" {
+			return fmt.Sprintf("%.1f%%", value)
+		}
+		return formatCompactFloat(value)
+	}
 }
 
 func addTotals(a, b Totals) Totals {
@@ -343,6 +543,13 @@ func formatInt(n int64) string {
 	if n < 0 {
 		return "-" + formatInt(-n)
 	}
+	return formatCompactFloat(float64(n))
+}
+
+func formatCompactFloat(n float64) string {
+	if n < 0 {
+		return "-" + formatCompactFloat(-n)
+	}
 	units := []struct {
 		value  float64
 		suffix string
@@ -353,11 +560,14 @@ func formatInt(n int64) string {
 		{value: 1_000, suffix: "K"},
 	}
 	for _, unit := range units {
-		if float64(n) >= unit.value {
-			return trimCompactFloat(float64(n)/unit.value) + unit.suffix
+		if n >= unit.value {
+			return trimCompactFloat(n/unit.value) + unit.suffix
 		}
 	}
-	return fmt.Sprintf("%d", n)
+	if math.Mod(n, 1) == 0 {
+		return fmt.Sprintf("%.0f", n)
+	}
+	return trimCompactFloat(n)
 }
 
 func trimCompactFloat(value float64) string {
@@ -382,6 +592,31 @@ func truncate(s string, width int) string {
 		return s[:width]
 	}
 	return s[:width-1] + "."
+}
+
+func compactTime(value string) string {
+	if len(value) >= len("2006-01-02T15:04") {
+		return value[:len("2006-01-02T15:04")]
+	}
+	return value
+}
+
+func hasDirectory(rows []Row) bool {
+	for _, row := range rows {
+		if row.Directory != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFunctionCalls(rows []Row) bool {
+	for _, row := range rows {
+		if row.FunctionCalls > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func limitOrDefault(limit int) int {

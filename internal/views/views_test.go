@@ -114,6 +114,159 @@ func TestLoadSummaryDoesNotDoubleCountTokenTypeRows(t *testing.T) {
 	}
 }
 
+func TestLoadSessionsIncludesDirectoryAndFunctionCalls(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.SaveFileSync(ctx, store.SourceFile{
+		Path:              "source.jsonl",
+		SizeBytes:         10,
+		ModTimeUnix:       1,
+		ProcessedOffset:   10,
+		SessionID:         "session-a",
+		SessionDir:        "/Users/example/project",
+		FunctionCallCount: 7,
+		LastSeenAt:        "2026-06-20T10:00:00Z",
+	}, []store.TokenEvent{
+		{
+			SessionID:         "session-a",
+			SourcePath:        "source.jsonl",
+			Timestamp:         "2026-06-20T10:00:00Z",
+			InputTokens:       1000,
+			CachedInputTokens: 250,
+			OutputTokens:      100,
+			TotalTokens:       1100,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := Load(ctx, db, "sessions", 20, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Rows) != 1 {
+		t.Fatalf("expected 1 session row, got %d", len(data.Rows))
+	}
+	if data.Rows[0].Directory != "/Users/example/project" {
+		t.Fatalf("expected session directory, got %q", data.Rows[0].Directory)
+	}
+	if data.Rows[0].FunctionCalls != 7 {
+		t.Fatalf("expected 7 function calls, got %d", data.Rows[0].FunctionCalls)
+	}
+
+	rendered := Render(data, "sessions")
+	if !strings.Contains(rendered, "Directory") || !strings.Contains(rendered, "Calls") {
+		t.Fatalf("expected rendered sessions table to include Directory and Calls columns:\n%s", rendered)
+	}
+}
+
+func TestLoadReasoningIncludesFunctionCallsByDay(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.SaveFileSync(ctx, store.SourceFile{
+		Path:              "source.jsonl",
+		SizeBytes:         10,
+		ModTimeUnix:       1,
+		ProcessedOffset:   10,
+		SessionID:         "session-a",
+		FunctionCallCount: 3,
+		LastSeenAt:        "2026-06-20T10:00:00Z",
+	}, []store.TokenEvent{
+		{
+			SessionID:             "session-a",
+			SourcePath:            "source.jsonl",
+			Timestamp:             "2026-06-20T10:00:00Z",
+			InputTokens:           100,
+			OutputTokens:          40,
+			ReasoningOutputTokens: 25,
+			TotalTokens:           140,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := Load(ctx, db, "reasoning", 20, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Rows) != 1 {
+		t.Fatalf("expected 1 reasoning row, got %d", len(data.Rows))
+	}
+	if data.Rows[0].FunctionCalls != 3 {
+		t.Fatalf("expected 3 function calls, got %d", data.Rows[0].FunctionCalls)
+	}
+	rendered := Render(data, "reasoning")
+	if !strings.Contains(rendered, "Calls") {
+		t.Fatalf("expected rendered reasoning table to include Calls column:\n%s", rendered)
+	}
+}
+
+func TestLoadCommandsGroupsByCommandName(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	source := store.SourceFile{
+		Path:              "source.jsonl",
+		SizeBytes:         10,
+		ModTimeUnix:       1,
+		ProcessedOffset:   10,
+		SessionID:         "session-a",
+		SessionDir:        "/Users/example/project",
+		FunctionCallCount: 3,
+		LastSeenAt:        "2026-06-20T10:00:00Z",
+	}
+	commands := []store.CommandEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", EventType: "function_call", CommandName: "shell", SessionDir: "/Users/example/project"},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:00Z", EventType: "function_call", CommandName: "shell", SessionDir: "/Users/example/project"},
+		{SessionID: "session-b", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:02:00Z", EventType: "function_call", CommandName: "apply_patch", SessionDir: "/Users/example/project"},
+	}
+	if err := db.SaveFileSyncWithCommands(ctx, source, nil, commands); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := Load(ctx, db, "commands", 20, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Rows) != 2 {
+		t.Fatalf("expected 2 command rows, got %d", len(data.Rows))
+	}
+	if data.Rows[0].Label != "shell" {
+		t.Fatalf("expected shell to rank first, got %q", data.Rows[0].Label)
+	}
+	if data.Rows[0].EventType != "function_call" {
+		t.Fatalf("expected function_call kind, got %q", data.Rows[0].EventType)
+	}
+	if data.Rows[0].FunctionCalls != 2 {
+		t.Fatalf("expected 2 shell calls, got %d", data.Rows[0].FunctionCalls)
+	}
+	if data.Rows[0].SessionCount != 1 {
+		t.Fatalf("expected 1 shell session, got %d", data.Rows[0].SessionCount)
+	}
+	rendered := Render(data, "commands")
+	for _, want := range []string{"Command", "Kind", "Calls", "Sessions", "Directories", "First Seen", "Last Seen"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected rendered commands table to include %q:\n%s", want, rendered)
+		}
+	}
+}
+
 func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 	data := Data{
 		View: "summary",
@@ -194,6 +347,27 @@ func TestFormatIntUsesCompactSuffixes(t *testing.T) {
 		if got := formatInt(input); got != want {
 			t.Fatalf("formatInt(%d) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestRenderGraphUsesCompactYAxisUnits(t *testing.T) {
+	data := Data{
+		View: "daily",
+		Totals: Totals{
+			TotalTokens: 1_500_000_000,
+		},
+		Rows: []Row{
+			{Label: "2026-06-20", Totals: withDerived(Totals{TotalTokens: 1_500_000_000, InputTokens: 1_500_000_000})},
+			{Label: "2026-06-21", Totals: withDerived(Totals{TotalTokens: 750_000_000, InputTokens: 750_000_000})},
+		},
+	}
+
+	rendered := Render(data, "daily")
+	if !strings.Contains(rendered, "B") && !strings.Contains(rendered, "M") {
+		t.Fatalf("expected compact graph y-axis labels, got:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "1500000000") {
+		t.Fatalf("expected graph y-axis to avoid raw long numbers, got:\n%s", rendered)
 	}
 }
 

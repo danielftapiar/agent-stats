@@ -49,7 +49,7 @@ func Run(ctx context.Context, args []string, out io.Writer) error {
 	switch cmd {
 	case "", "tui":
 		return tui.Run(ctx, db, indexer)
-	case "summary", "today", "daily", "sessions", "hourly", "cache", "reasoning", "tokens", "top", "graph":
+	case "summary", "today", "daily", "sessions", "hourly", "cache", "reasoning", "commands", "tokens", "top", "graph":
 		return printView(ctx, out, db, cmd, opts)
 	case "export":
 		return exportJSON(ctx, out, db)
@@ -143,6 +143,7 @@ Usage:
   agent-stats hourly
   agent-stats cache
   agent-stats reasoning
+  agent-stats commands
   agent-stats tokens
   agent-stats top [--limit 20]
   agent-stats export

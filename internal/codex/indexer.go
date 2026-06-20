@@ -92,6 +92,13 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		meta = store.SourceFile{}
 		found = false
 	}
+	if found && meta.SessionDir == "" {
+		if err := i.db.DeleteSourceFileEvents(ctx, path); err != nil {
+			return err
+		}
+		meta = store.SourceFile{}
+		found = false
+	}
 	if found && meta.SizeBytes == size && meta.ModTimeUnix == modTime {
 		return nil
 	}
@@ -100,6 +107,7 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 			return err
 		}
 		meta = store.SourceFile{}
+		found = false
 	}
 
 	file, err := os.Open(path)
@@ -114,29 +122,40 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		}
 	}
 
-	events, offset, checkpoint, err := ParseFile(file, path, sessionID, meta.ProcessedOffset, usageFromSourceFile(meta))
+	result, err := ParseFile(file, path, sessionID, meta.ProcessedOffset, usageFromSourceFile(meta))
 	if err != nil {
 		return err
 	}
-	if len(events) == 0 && offset < size {
-		offset = size
+	if len(result.Events) == 0 && result.Offset < size {
+		result.Offset = size
 	}
 	source := store.SourceFile{
-		Path:            path,
-		SizeBytes:       size,
-		ModTimeUnix:     modTime,
-		ProcessedOffset: offset,
-		SessionID:       sessionID,
+		Path:              path,
+		SizeBytes:         size,
+		ModTimeUnix:       modTime,
+		ProcessedOffset:   result.Offset,
+		SessionID:         sessionID,
+		SessionDir:        result.SessionDir,
+		FunctionCallCount: int64(len(result.Commands)),
 	}
-	applyCheckpoint(&source, checkpoint)
-	if len(events) > 0 {
-		source.StartedAt = events[0].Timestamp
-		source.LastSeenAt = events[len(events)-1].Timestamp
+	if found {
+		if source.SessionDir == "" {
+			source.SessionDir = meta.SessionDir
+		}
+		source.FunctionCallCount += meta.FunctionCallCount
+	}
+	applyCheckpoint(&source, result.Checkpoint)
+	if len(result.Events) > 0 {
+		source.StartedAt = result.Events[0].Timestamp
+		source.LastSeenAt = result.Events[len(result.Events)-1].Timestamp
 	} else if found {
 		source.StartedAt = meta.StartedAt
 		source.LastSeenAt = meta.LastSeenAt
 	}
-	return i.db.SaveFileSync(ctx, source, events)
+	for i := range result.Commands {
+		result.Commands[i].SessionDir = source.SessionDir
+	}
+	return i.db.SaveFileSyncWithCommands(ctx, source, result.Events, result.Commands)
 }
 
 func SessionID(path string) string {
@@ -153,6 +172,8 @@ type rawLine struct {
 type rawPayload struct {
 	Type string   `json:"type"`
 	Info *rawInfo `json:"info"`
+	CWD  string   `json:"cwd"`
+	Name string   `json:"name"`
 }
 
 type rawInfo struct {
@@ -169,24 +190,46 @@ type rawUsage struct {
 	TotalTokens           int64 `json:"total_tokens"`
 }
 
-func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, initialPrevious rawUsage) ([]store.TokenEvent, int64, rawUsage, error) {
+type ParseResult struct {
+	Events     []store.TokenEvent
+	Offset     int64
+	Checkpoint rawUsage
+	SessionDir string
+	Commands   []store.CommandEvent
+}
+
+func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, initialPrevious rawUsage) (ParseResult, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
 
-	var events []store.TokenEvent
+	result := ParseResult{Offset: startOffset, Checkpoint: initialPrevious}
 	previous := initialPrevious
 	hasPrevious := !previous.isZero()
-	offset := startOffset
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		offset += int64(len(line)) + 1
+		result.Offset += int64(len(line)) + 1
 		if len(strings.TrimSpace(string(line))) == 0 {
 			continue
 		}
 
 		var raw rawLine
 		if err := json.Unmarshal(line, &raw); err != nil {
+			continue
+		}
+		if raw.Type == "session_meta" && raw.Payload.CWD != "" {
+			result.SessionDir = raw.Payload.CWD
+			continue
+		}
+		if raw.Type == "response_item" && raw.Payload.Type == "function_call" {
+			result.Commands = append(result.Commands, store.CommandEvent{
+				SessionID:   sessionID,
+				SourcePath:  sourcePath,
+				Timestamp:   raw.Timestamp,
+				EventType:   raw.Payload.Type,
+				CommandName: commandName(raw.Payload.Name),
+				SessionDir:  result.SessionDir,
+			})
 			continue
 		}
 		if raw.Payload.Type != "token_count" || raw.Payload.Info == nil {
@@ -199,12 +242,13 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 		}
 		usage, ok := eventUsage(raw.Payload.Info, previous, hasPrevious)
 		previous = current
+		result.Checkpoint = previous
 		hasPrevious = true
 		if !ok || usage.TotalTokens <= 0 {
 			continue
 		}
 
-		events = append(events, store.TokenEvent{
+		result.Events = append(result.Events, store.TokenEvent{
 			SessionID:             sessionID,
 			SourcePath:            sourcePath,
 			Timestamp:             raw.Timestamp,
@@ -218,11 +262,22 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 	}
 	if err := scanner.Err(); err != nil {
 		if errors.Is(err, bufio.ErrFinalToken) {
-			return events, offset, previous, nil
+			result.Checkpoint = previous
+			return result, nil
 		}
-		return nil, offset, previous, err
+		result.Checkpoint = previous
+		return result, err
 	}
-	return events, offset, previous, nil
+	result.Checkpoint = previous
+	return result, nil
+}
+
+func commandName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "(unknown)"
+	}
+	return name
 }
 
 func eventUsage(info *rawInfo, previous rawUsage, hasPrevious bool) (rawUsage, bool) {

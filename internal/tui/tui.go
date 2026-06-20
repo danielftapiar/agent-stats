@@ -25,6 +25,7 @@ var viewNames = []string{
 	"hourly",
 	"cache",
 	"reasoning",
+	"commands",
 	"tokens",
 	"top",
 }
@@ -115,7 +116,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.SetValue("")
 			return m, nil
 		case "?":
-			m.err = "commands: :summary :today :daily :sessions :hourly :cache :reasoning :tokens :top :theme :quit"
+			m.err = commandHelp()
 			return m, nil
 		case "tab":
 			m.active = (m.active + 1) % len(viewNames)
@@ -173,7 +174,7 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.err = ""
 			m.reload()
 		} else if value == "help" {
-			m.err = "commands: :summary :today :daily :sessions :hourly :cache :reasoning :tokens :top :theme :quit"
+			m.err = commandHelp()
 		} else {
 			m.err = fmt.Sprintf("unknown command :%s", value)
 		}
@@ -182,6 +183,10 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+func commandHelp() string {
+	return "commands: :summary :today :daily :sessions :hourly :cache :reasoning :commands :tokens :top :theme :quit"
 }
 
 func (m model) updateThemePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
