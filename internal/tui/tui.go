@@ -22,7 +22,6 @@ var viewNames = []string{
 	"today",
 	"daily",
 	"sessions",
-	"hourly",
 	"cache",
 	"reasoning",
 	"commands",
@@ -231,7 +230,7 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func commandHelp() string {
-	return "commands: :summary :today :daily :sessions :hourly :cache :reasoning :commands :payload :tokens :top :theme :quit"
+	return "commands: :summary :today :daily :sessions :cache :reasoning :commands :payload :tokens :top :theme :quit"
 }
 
 func (m model) updateThemePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

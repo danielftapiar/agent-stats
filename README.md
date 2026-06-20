@@ -68,11 +68,10 @@ The CLI should support a small set of useful views over the same parsed token da
 
 Useful views:
 
-- `summary`: totals over the selected time range, grouped by token type.
+- `summary`: weekly credit spend, cache hit rate, and function-call totals.
 - `today`: current-day totals, grouped by token type and session.
 - `daily`: usage grouped by day, with stacked token types.
-- `sessions`: usage grouped by Codex session, sorted by latest activity.
-- `hourly`: usage grouped by hour of day to show active working periods.
+- `sessions`: usage grouped by Codex session, sorted by latest activity, with model and credits.
 - `cache`: cache hit rate grouped by day or session.
 - `reasoning`: reasoning output tokens grouped by day or session.
 - `commands`: function calls grouped by command name, with call count, session count, directory count, and first/last seen timestamps.
@@ -84,10 +83,9 @@ Useful group-by combinations:
 
 | View | Primary group | Secondary group | Useful for |
 | --- | --- | --- | --- |
-| `summary` | time range | token type | Understanding total usage at a glance |
+| `summary` | `YEAR-W##` | credits/cache/function calls | Understanding weekly spend and cache efficiency |
 | `daily` | day | token type | Spotting heavy usage days |
 | `sessions` | session | token type | Finding expensive sessions |
-| `hourly` | hour | token type | Seeing when usage happens |
 | `cache --group day` | day | cache hit/miss | Tracking cache efficiency over time |
 | `cache --group session` | session | cache hit/miss | Finding sessions with poor cache reuse |
 | `reasoning --group day` | day | reasoning output | Tracking reasoning-heavy usage |
@@ -118,7 +116,6 @@ Interactive mode should support colon commands for switching views:
 :today
 :daily
 :sessions
-:hourly
 :cache
 :reasoning
 :commands
@@ -322,6 +319,7 @@ CREATE TABLE token_events (
   reasoning_output_tokens INTEGER NOT NULL,
   total_tokens INTEGER NOT NULL,
   model_context_window INTEGER
+  model TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE command_events (
@@ -355,8 +353,17 @@ CREATE TABLE payload_events (
   reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
   total_tokens INTEGER NOT NULL DEFAULT 0,
   model_context_window INTEGER NOT NULL DEFAULT 0,
+  model TEXT NOT NULL DEFAULT '',
   payload_json TEXT NOT NULL DEFAULT '',
   raw_json TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE model_credit_rates (
+  model TEXT PRIMARY KEY,
+  input_credits_per_million REAL NOT NULL,
+  cached_input_credits_per_million REAL NOT NULL,
+  output_credits_per_million REAL NOT NULL,
+  reasoning_credits_per_million REAL NOT NULL
 );
 
 CREATE INDEX token_events_timestamp_idx ON token_events(timestamp);
@@ -367,13 +374,13 @@ CREATE INDEX payload_events_type_idx ON payload_events(top_level_type, payload_t
 
 The `token_events` table should store per-event increments, not cumulative totals. That keeps every view simple:
 
-- `summary`: sum columns over the selected time range.
+- `summary`: group token and command totals by `YEAR-W##`, such as `2026-W01`.
 - `daily`: group by `date(timestamp)`.
-- `hourly`: group by hour.
 - `sessions`: group by `session_id`.
 - `cache`: calculate from summed `cached_input_tokens` and `input_tokens`.
 - `commands`: group `command_events` by `command_name`.
 - `payload`: group `payload_events` by event shape, or by token-count interaction within one session.
+- `credits`: join token rows to `model_credit_rates` by model and apply the per-million-token relationship.
 
 Startup algorithm:
 
@@ -385,8 +392,9 @@ Startup algorithm:
 6. If changed and larger, seek to `processed_offset` and parse only appended lines.
 7. If changed and smaller, delete that file's cached events and reprocess from `0`.
 8. Store `response_item` function calls in `command_events` with command name, timestamp, session, and session directory.
-9. Store every JSONL payload in `payload_events`, including raw payload JSON, payload length, timing fields, token usage for `token_count`, and normalized shell command names.
-10. Update `source_files` in the same transaction as inserted events.
+9. Store every JSONL payload in `payload_events`, including raw payload JSON, payload length, timing fields, token usage for `token_count`, model, and normalized shell command names.
+10. Seed `model_credit_rates` for known Codex models. The table is local and editable if Codex changes credit accounting.
+11. Update `source_files` in the same transaction as inserted events.
 
 Interactive streaming algorithm:
 

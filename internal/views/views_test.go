@@ -102,7 +102,7 @@ func TestLoadSummaryDoesNotDoubleCountTokenTypeRows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := Load(ctx, db, "summary", 20, time.Now())
+	data, err := Load(ctx, db, "tokens", 20, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +111,50 @@ func TestLoadSummaryDoesNotDoubleCountTokenTypeRows(t *testing.T) {
 	}
 	if data.Totals.CachedInputTokens != 20 {
 		t.Fatalf("expected cached tokens to remain visible, got %d", data.Totals.CachedInputTokens)
+	}
+}
+
+func TestLoadSummaryGroupsWeeklyCreditsAndFunctionCalls(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	source := store.SourceFile{
+		Path:              "source.jsonl",
+		SizeBytes:         10,
+		ModTimeUnix:       1,
+		ProcessedOffset:   10,
+		SessionID:         "session-a",
+		SessionDir:        "/Users/example/project",
+		Model:             "gpt-5.5",
+		FunctionCallCount: 1,
+		LastSeenAt:        "2026-06-20T10:00:00Z",
+	}
+	events := []store.TokenEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", InputTokens: 1_000_000, CachedInputTokens: 1_000_000, OutputTokens: 500_000, ReasoningOutputTokens: 250_000, TotalTokens: 1_500_000, Model: "gpt-5.5"},
+	}
+	commands := []store.CommandEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", EventType: "function_call", CommandName: "exec_command", SessionDir: "/Users/example/project"},
+	}
+	if err := db.SaveFileSyncWithCommands(ctx, source, events, commands); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := Load(ctx, db, "summary", 20, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Rows) != 1 {
+		t.Fatalf("expected 1 weekly summary row, got %d", len(data.Rows))
+	}
+	if data.Rows[0].FunctionCalls != 1 {
+		t.Fatalf("expected 1 function call, got %d", data.Rows[0].FunctionCalls)
+	}
+	if data.Rows[0].Totals.Credits != 4.25 {
+		t.Fatalf("expected 4.25 credits, got %f", data.Rows[0].Totals.Credits)
 	}
 }
 
@@ -129,6 +173,7 @@ func TestLoadSessionsIncludesDirectoryAndFunctionCalls(t *testing.T) {
 		ProcessedOffset:   10,
 		SessionID:         "session-a",
 		SessionDir:        "/Users/example/project",
+		Model:             "gpt-5.5",
 		FunctionCallCount: 7,
 		LastSeenAt:        "2026-06-20T10:00:00Z",
 	}, []store.TokenEvent{
@@ -140,6 +185,7 @@ func TestLoadSessionsIncludesDirectoryAndFunctionCalls(t *testing.T) {
 			CachedInputTokens: 250,
 			OutputTokens:      100,
 			TotalTokens:       1100,
+			Model:             "gpt-5.5",
 		},
 	})
 	if err != nil {
@@ -156,13 +202,19 @@ func TestLoadSessionsIncludesDirectoryAndFunctionCalls(t *testing.T) {
 	if data.Rows[0].Directory != "/Users/example/project" {
 		t.Fatalf("expected session directory, got %q", data.Rows[0].Directory)
 	}
+	if data.Rows[0].Model != "gpt-5.5" {
+		t.Fatalf("expected session model gpt-5.5, got %q", data.Rows[0].Model)
+	}
 	if data.Rows[0].FunctionCalls != 7 {
 		t.Fatalf("expected 7 function calls, got %d", data.Rows[0].FunctionCalls)
 	}
+	if data.Rows[0].Totals.Credits == 0 {
+		t.Fatal("expected session credits to be calculated")
+	}
 
 	rendered := Render(data, "sessions")
-	if !strings.Contains(rendered, "Directory") || !strings.Contains(rendered, "FCalls") {
-		t.Fatalf("expected rendered sessions table to include Directory and FCalls columns:\n%s", rendered)
+	if !strings.Contains(rendered, "Directory") || !strings.Contains(rendered, "Model") || !strings.Contains(rendered, "Credits") || !strings.Contains(rendered, "FCalls") {
+		t.Fatalf("expected rendered sessions table to include Directory, Model, Credits and FCalls columns:\n%s", rendered)
 	}
 	if !strings.Contains(rendered, "example/project") || strings.Contains(rendered, "/Users/example/project") {
 		t.Fatalf("expected rendered directory to use last two path components:\n%s", rendered)
@@ -344,27 +396,16 @@ func TestLoadPayloadSummariesAndSessionInteractions(t *testing.T) {
 func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 	data := Data{
 		View: "summary",
-		Totals: Totals{
-			InputTokens:           1733772383,
-			CachedInputTokens:     1656928512,
-			OutputTokens:          5163766,
-			ReasoningOutputTokens: 1770977,
-			TotalTokens:           1740918485,
-			CacheHitRate:          0.9787,
-		},
 		Rows: []Row{
-			{Label: "uncached input", Totals: withDerived(Totals{TotalTokens: 1733772383, InputTokens: 1733772383})},
-			{Label: "cache read", Totals: withDerived(Totals{TotalTokens: 1656928512, CachedInputTokens: 1656928512})},
-			{Label: "cache creation", Totals: withDerived(Totals{})},
-			{Label: "output", Totals: Totals{TotalTokens: 5163766, OutputTokens: 5163766}},
-			{Label: "reasoning output", Totals: Totals{TotalTokens: 1770977, ReasoningOutputTokens: 1770977}},
+			{Label: "2026-W24", FunctionCalls: 1234, LastSeen: "2026-06-20T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1740918485, InputTokens: 1733772383, CachedInputTokens: 1656928512, OutputTokens: 5163766, ReasoningOutputTokens: 1770977, Credits: 4200.5})},
+			{Label: "2026-W23", FunctionCalls: 12, LastSeen: "2026-06-13T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1200, InputTokens: 1000, CachedInputTokens: 200, OutputTokens: 200, Credits: 0.5})},
 		},
 	}
 
 	lines := strings.Split(Render(data, "summary"), "\n")
 	headerIndex := -1
 	for i, line := range lines {
-		if strings.HasPrefix(line, "Group") {
+		if strings.HasPrefix(line, "Week ") {
 			headerIndex = i
 			break
 		}
@@ -373,13 +414,10 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 		t.Fatal("summary table header not found")
 	}
 
-	expectedHeader := []string{"Group", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Hit Rate"}
+	expectedHeader := []string{"Week", "Credits", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls", "Last Seen"}
 	expectedRows := [][]string{
-		{"uncached input", "1.73B", "1.73B", "0", "0", "0", "0.0%"},
-		{"cache read", "1.66B", "0", "1.66B", "0", "0", "100.0%"},
-		{"cache creation", "0", "0", "0", "0", "0", "0.0%"},
-		{"output", "5.16M", "0", "0", "5.16M", "0", "0.0%"},
-		{"reasoning output", "1.77M", "0", "0", "0", "1.77M", "0.0%"},
+		{"2026-W24", "4.2K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K", "2026-06-20T10:00"},
+		{"2026-W23", "0.5", "1.2K", "1K", "200", "16.7%", "12", "2026-06-13T10:00"},
 	}
 	columns := columnsFor(append([][]string{expectedHeader}, expectedRows...))
 	assertTableLineAligned(t, lines[headerIndex], columns, expectedHeader)

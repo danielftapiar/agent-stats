@@ -100,6 +100,13 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		meta = store.SourceFile{}
 		found = false
 	}
+	if found && meta.Model == "" {
+		if err := i.db.DeleteSourceFileEvents(ctx, path); err != nil {
+			return err
+		}
+		meta = store.SourceFile{}
+		found = false
+	}
 	if found {
 		hasPayloads, err := i.db.HasPayloadEvents(ctx, path)
 		if err != nil {
@@ -136,7 +143,7 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		}
 	}
 
-	result, err := ParseFile(file, path, sessionID, meta.ProcessedOffset, usageFromSourceFile(meta))
+	result, err := ParseFile(file, path, sessionID, meta.ProcessedOffset, usageFromSourceFile(meta), meta.Model)
 	if err != nil {
 		return err
 	}
@@ -150,11 +157,15 @@ func (i *Indexer) syncFileWithInfo(ctx context.Context, path string, info os.Fil
 		ProcessedOffset:   result.Offset,
 		SessionID:         sessionID,
 		SessionDir:        result.SessionDir,
+		Model:             result.Model,
 		FunctionCallCount: int64(len(result.Commands)),
 	}
 	if found {
 		if source.SessionDir == "" {
 			source.SessionDir = meta.SessionDir
+		}
+		if source.Model == "" {
+			source.Model = meta.Model
 		}
 		source.FunctionCallCount += meta.FunctionCallCount
 	}
@@ -187,6 +198,7 @@ type rawPayload struct {
 	Type               string          `json:"type"`
 	Info               *rawInfo        `json:"info"`
 	CWD                string          `json:"cwd"`
+	Model              string          `json:"model"`
 	Name               string          `json:"name"`
 	Namespace          string          `json:"namespace"`
 	Arguments          string          `json:"arguments"`
@@ -216,17 +228,19 @@ type ParseResult struct {
 	Offset     int64
 	Checkpoint rawUsage
 	SessionDir string
+	Model      string
 	Commands   []store.CommandEvent
 	Payloads   []store.PayloadEvent
 }
 
-func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, initialPrevious rawUsage) (ParseResult, error) {
+func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, initialPrevious rawUsage, initialModel string) (ParseResult, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
 
-	result := ParseResult{Offset: startOffset, Checkpoint: initialPrevious}
+	result := ParseResult{Offset: startOffset, Checkpoint: initialPrevious, Model: initialModel}
 	previous := initialPrevious
 	hasPrevious := !previous.isZero()
+	currentModel := initialModel
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -245,6 +259,10 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 				payload = rawPayload{}
 			}
 		}
+		if raw.Type == "turn_context" && payload.Model != "" {
+			currentModel = payload.Model
+			result.Model = payload.Model
+		}
 		payloadEvent := store.PayloadEvent{
 			SessionID:          sessionID,
 			SourcePath:         sourcePath,
@@ -259,6 +277,7 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 			CommandName:        commandName(payload.Name),
 			NormalizedCommand:  normalizedPayloadCommand(payload),
 			CallID:             payload.CallID,
+			Model:              currentModel,
 			PayloadJSON:        string(raw.Payload),
 			RawJSON:            string(line),
 		}
@@ -305,6 +324,7 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 		payloadEvent.ReasoningOutputTokens = usage.ReasoningOutputTokens
 		payloadEvent.TotalTokens = usage.TotalTokens
 		payloadEvent.ModelContextWindow = payload.Info.ModelContextSize
+		payloadEvent.Model = currentModel
 		result.Payloads = append(result.Payloads, payloadEvent)
 		if !ok || usage.TotalTokens <= 0 {
 			continue
@@ -320,6 +340,7 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 			ReasoningOutputTokens: usage.ReasoningOutputTokens,
 			TotalTokens:           usage.TotalTokens,
 			ModelContextWindow:    payload.Info.ModelContextSize,
+			Model:                 currentModel,
 		})
 	}
 	if err := scanner.Err(); err != nil {

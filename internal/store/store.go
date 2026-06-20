@@ -21,6 +21,7 @@ type SourceFile struct {
 	ProcessedOffset            int64
 	SessionID                  string
 	SessionDir                 string
+	Model                      string
 	FunctionCallCount          int64
 	StartedAt                  string
 	LastSeenAt                 string
@@ -42,6 +43,7 @@ type TokenEvent struct {
 	ReasoningOutputTokens int64  `json:"reasoning_output_tokens"`
 	TotalTokens           int64  `json:"total_tokens"`
 	ModelContextWindow    int64  `json:"model_context_window,omitempty"`
+	Model                 string `json:"model,omitempty"`
 }
 
 type CommandEvent struct {
@@ -75,6 +77,7 @@ type PayloadEvent struct {
 	ReasoningOutputTokens int64  `json:"reasoning_output_tokens,omitempty"`
 	TotalTokens           int64  `json:"total_tokens,omitempty"`
 	ModelContextWindow    int64  `json:"model_context_window,omitempty"`
+	Model                 string `json:"model,omitempty"`
 	PayloadJSON           string `json:"payload_json,omitempty"`
 	RawJSON               string `json:"raw_json,omitempty"`
 }
@@ -120,6 +123,7 @@ func (db *DB) migrate(ctx context.Context) error {
 			processed_offset INTEGER NOT NULL,
 			session_id TEXT NOT NULL,
 			session_dir TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
 			function_call_count INTEGER NOT NULL DEFAULT 0,
 			started_at TEXT,
 			last_seen_at TEXT,
@@ -135,6 +139,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		`ALTER TABLE source_files ADD COLUMN last_total_reasoning_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE source_files ADD COLUMN last_total_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE source_files ADD COLUMN session_dir TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE source_files ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE source_files ADD COLUMN function_call_count INTEGER NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS token_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,8 +151,10 @@ func (db *DB) migrate(ctx context.Context) error {
 			output_tokens INTEGER NOT NULL,
 			reasoning_output_tokens INTEGER NOT NULL,
 			total_tokens INTEGER NOT NULL,
-			model_context_window INTEGER
+			model_context_window INTEGER,
+			model TEXT NOT NULL DEFAULT ''
 		)`,
+		`ALTER TABLE token_events ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS token_events_timestamp_idx ON token_events(timestamp)`,
 		`CREATE INDEX IF NOT EXISTS token_events_session_idx ON token_events(session_id)`,
 		`CREATE INDEX IF NOT EXISTS token_events_source_path_idx ON token_events(source_path)`,
@@ -185,14 +192,31 @@ func (db *DB) migrate(ctx context.Context) error {
 			reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			model_context_window INTEGER NOT NULL DEFAULT 0,
+			model TEXT NOT NULL DEFAULT '',
 			payload_json TEXT NOT NULL DEFAULT '',
 			raw_json TEXT NOT NULL DEFAULT ''
 		)`,
+		`ALTER TABLE payload_events ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS payload_events_timestamp_idx ON payload_events(timestamp)`,
 		`CREATE INDEX IF NOT EXISTS payload_events_session_idx ON payload_events(session_id)`,
 		`CREATE INDEX IF NOT EXISTS payload_events_source_path_idx ON payload_events(source_path)`,
 		`CREATE INDEX IF NOT EXISTS payload_events_type_idx ON payload_events(top_level_type, payload_type, phase)`,
 		`CREATE INDEX IF NOT EXISTS payload_events_normalized_command_idx ON payload_events(normalized_command)`,
+		`CREATE TABLE IF NOT EXISTS model_credit_rates (
+			model TEXT PRIMARY KEY,
+			input_credits_per_million REAL NOT NULL,
+			cached_input_credits_per_million REAL NOT NULL,
+			output_credits_per_million REAL NOT NULL,
+			reasoning_credits_per_million REAL NOT NULL
+		)`,
+		`INSERT OR IGNORE INTO model_credit_rates (model, input_credits_per_million, cached_input_credits_per_million, output_credits_per_million, reasoning_credits_per_million) VALUES
+			('codex-1', 1.0, 0.25, 4.0, 4.0),
+			('gpt-5.3-codex', 1.0, 0.25, 4.0, 4.0),
+			('gpt-5.3-codex-spark', 1.0, 0.25, 4.0, 4.0),
+			('gpt-5.4-codex', 1.0, 0.25, 4.0, 4.0),
+			('gpt-5.5', 1.0, 0.25, 4.0, 4.0),
+			('gpt-5.5-codex', 1.0, 0.25, 4.0, 4.0),
+			('unknown', 1.0, 0.25, 4.0, 4.0)`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.sql.ExecContext(ctx, stmt); err != nil {
@@ -213,6 +237,7 @@ func (db *DB) SourceFile(ctx context.Context, path string) (SourceFile, bool, er
 		processed_offset,
 		session_id,
 		session_dir,
+		model,
 		function_call_count,
 		COALESCE(started_at, ''),
 		COALESCE(last_seen_at, ''),
@@ -230,6 +255,7 @@ func (db *DB) SourceFile(ctx context.Context, path string) (SourceFile, bool, er
 		&sf.ProcessedOffset,
 		&sf.SessionID,
 		&sf.SessionDir,
+		&sf.Model,
 		&sf.FunctionCallCount,
 		&sf.StartedAt,
 		&sf.LastSeenAt,
@@ -296,8 +322,8 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 	for _, event := range events {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO token_events (
 			session_id, source_path, timestamp, input_tokens, cached_input_tokens, output_tokens,
-			reasoning_output_tokens, total_tokens, model_context_window
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			reasoning_output_tokens, total_tokens, model_context_window, model
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			event.SessionID,
 			event.SourcePath,
 			event.Timestamp,
@@ -307,6 +333,7 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 			event.ReasoningOutputTokens,
 			event.TotalTokens,
 			event.ModelContextWindow,
+			event.Model,
 		); err != nil {
 			tx.Rollback()
 			return err
@@ -332,8 +359,8 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 			session_id, source_path, timestamp, top_level_type, payload_type, phase, payload_bytes,
 			completed_at, duration_ms, time_to_first_token_ms, command_name, normalized_command, call_id,
 			input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-			model_context_window, payload_json, raw_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			model_context_window, model, payload_json, raw_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			payload.SessionID,
 			payload.SourcePath,
 			payload.Timestamp,
@@ -353,6 +380,7 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 			payload.ReasoningOutputTokens,
 			payload.TotalTokens,
 			payload.ModelContextWindow,
+			payload.Model,
 			payload.PayloadJSON,
 			payload.RawJSON,
 		); err != nil {
@@ -367,6 +395,7 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 		processed_offset,
 		session_id,
 		session_dir,
+		model,
 		function_call_count,
 		started_at,
 		last_seen_at,
@@ -375,13 +404,14 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 		last_total_output_tokens,
 		last_total_reasoning_tokens,
 		last_total_tokens
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		size_bytes = excluded.size_bytes,
 		mod_time_unix = excluded.mod_time_unix,
 		processed_offset = excluded.processed_offset,
 		session_id = excluded.session_id,
 		session_dir = COALESCE(NULLIF(excluded.session_dir, ''), source_files.session_dir),
+		model = COALESCE(NULLIF(excluded.model, ''), source_files.model),
 		function_call_count = excluded.function_call_count,
 		started_at = COALESCE(NULLIF(source_files.started_at, ''), excluded.started_at),
 		last_seen_at = excluded.last_seen_at,
@@ -396,6 +426,7 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 		source.ProcessedOffset,
 		source.SessionID,
 		source.SessionDir,
+		source.Model,
 		source.FunctionCallCount,
 		source.StartedAt,
 		source.LastSeenAt,
@@ -416,7 +447,7 @@ func (db *DB) Query(ctx context.Context, query string, args ...any) (*sql.Rows, 
 }
 
 func (db *DB) Events(ctx context.Context) ([]TokenEvent, error) {
-	rows, err := db.sql.QueryContext(ctx, `SELECT id, session_id, source_path, timestamp, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, COALESCE(model_context_window, 0) FROM token_events ORDER BY timestamp DESC, id DESC`)
+	rows, err := db.sql.QueryContext(ctx, `SELECT id, session_id, source_path, timestamp, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, COALESCE(model_context_window, 0), COALESCE(model, '') FROM token_events ORDER BY timestamp DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -435,6 +466,7 @@ func (db *DB) Events(ctx context.Context) ([]TokenEvent, error) {
 			&event.ReasoningOutputTokens,
 			&event.TotalTokens,
 			&event.ModelContextWindow,
+			&event.Model,
 		); err != nil {
 			return nil, err
 		}
