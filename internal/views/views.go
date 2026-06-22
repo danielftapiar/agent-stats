@@ -66,6 +66,7 @@ type Data struct {
 	Interaction   string `json:"interaction,omitempty"`
 	SelectedIndex int    `json:"selected_index,omitempty"`
 	Summary       []Row  `json:"summary,omitempty"`
+	DetailFields  []Row  `json:"detail_fields,omitempty"`
 	Detail        string `json:"detail,omitempty"`
 	GraphRows     []Row  `json:"graph_rows,omitempty"`
 	Totals        Totals `json:"totals"`
@@ -154,11 +155,11 @@ func LoadSessionPayload(ctx context.Context, db *store.DB, sessionID string, lim
 func LoadPayloadInteraction(ctx context.Context, db *store.DB, sessionID, interaction string) (Data, error) {
 	payloadID, err := strconv.ParseInt(interaction, 10, 64)
 	if err == nil && payloadID > 0 {
-		detail, err := queryPayloadDetail(ctx, db, sessionID, payloadID)
+		detail, fields, err := queryPayloadDetail(ctx, db, sessionID, payloadID)
 		if err != nil {
 			return Data{}, err
 		}
-		return Data{View: "payload", Session: sessionID, Interaction: interaction, SelectedIndex: -1, Detail: detail}, nil
+		return Data{View: "payload", Session: sessionID, Interaction: interaction, SelectedIndex: -1, Detail: detail, DetailFields: fields}, nil
 	}
 	summary, err := queryInteractionSummary(ctx, db, sessionID, interaction)
 	if err != nil {
@@ -543,41 +544,90 @@ func previousInteraction(ctx context.Context, db *store.DB, sessionID, interacti
 	return previous, rows.Err()
 }
 
-func queryPayloadDetail(ctx context.Context, db *store.DB, sessionID string, payloadID int64) (string, error) {
-	payloadType, callID, payloadJSON, rawJSON, err := payloadDetailRow(ctx, db, `id = ? AND session_id = ?`, payloadID, sessionID)
-	if err != nil {
-		return "", err
-	}
-	if payloadType == "function_call" && callID != "" {
-		_, _, outputPayloadJSON, outputRawJSON, err := payloadDetailRow(ctx, db, `session_id = ? AND call_id = ? AND payload_type = 'function_call_output'`, sessionID, callID)
-		if err == nil && (outputPayloadJSON != "" || outputRawJSON != "") {
-			return formatPayloadDetail(outputPayloadJSON, outputRawJSON), nil
-		}
-	}
-	return formatPayloadDetail(payloadJSON, rawJSON), nil
+type payloadDetail struct {
+	ID          int64
+	Timestamp   string
+	TopLevel    string
+	PayloadType string
+	Phase       string
+	Role        string
+	Command     string
+	CallID      string
+	PayloadJSON string
+	RawJSON     string
 }
 
-func payloadDetailRow(ctx context.Context, db *store.DB, where string, args ...any) (string, string, string, string, error) {
-	query := `SELECT payload_type, call_id, payload_json, raw_json
+func queryPayloadDetail(ctx context.Context, db *store.DB, sessionID string, payloadID int64) (string, []Row, error) {
+	detail, err := payloadDetailRow(ctx, db, `id = ? AND session_id = ?`, payloadID, sessionID)
+	if err != nil {
+		return "", nil, err
+	}
+	if detail.PayloadType == "function_call" && detail.CallID != "" {
+		outputDetail, err := payloadDetailRow(ctx, db, `session_id = ? AND call_id = ? AND payload_type = 'function_call_output'`, sessionID, detail.CallID)
+		if err == nil && (outputDetail.PayloadJSON != "" || outputDetail.RawJSON != "") {
+			return formatPayloadDetail(outputDetail.PayloadJSON, outputDetail.RawJSON), payloadDetailFields(outputDetail), nil
+		}
+	}
+	return formatPayloadDetail(detail.PayloadJSON, detail.RawJSON), payloadDetailFields(detail), nil
+}
+
+func payloadDetailRow(ctx context.Context, db *store.DB, where string, args ...any) (payloadDetail, error) {
+	query := `SELECT id, timestamp, top_level_type, payload_type, phase, role,
+			COALESCE(NULLIF(normalized_command, ''), NULLIF(command_name, ''), ''),
+			call_id, payload_json, raw_json
 		FROM payload_events
 		WHERE ` + where + `
 		ORDER BY timestamp ASC, id ASC
 		LIMIT 1`
 	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
-		return "", "", "", "", err
+		return payloadDetail{}, err
 	}
 	defer rows.Close()
-	var payloadType, callID, payloadJSON, rawJSON string
+	var detail payloadDetail
 	if rows.Next() {
-		if err := rows.Scan(&payloadType, &callID, &payloadJSON, &rawJSON); err != nil {
-			return "", "", "", "", err
+		if err := rows.Scan(
+			&detail.ID,
+			&detail.Timestamp,
+			&detail.TopLevel,
+			&detail.PayloadType,
+			&detail.Phase,
+			&detail.Role,
+			&detail.Command,
+			&detail.CallID,
+			&detail.PayloadJSON,
+			&detail.RawJSON,
+		); err != nil {
+			return payloadDetail{}, err
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return "", "", "", "", err
+		return payloadDetail{}, err
 	}
-	return payloadType, callID, payloadJSON, rawJSON, nil
+	return detail, nil
+}
+
+func payloadDetailFields(detail payloadDetail) []Row {
+	values := []struct {
+		key   string
+		value string
+	}{
+		{key: "type", value: detail.PayloadType},
+		{key: "metadata", value: detail.TopLevel},
+		{key: "phase", value: detail.Phase},
+		{key: "role", value: detail.Role},
+		{key: "command", value: detail.Command},
+		{key: "call_id", value: detail.CallID},
+		{key: "timestamp", value: compactTime(detail.Timestamp)},
+	}
+	fields := make([]Row, 0, len(values))
+	for _, value := range values {
+		if value.value == "" {
+			continue
+		}
+		fields = append(fields, Row{Label: value.key, Phase: value.value})
+	}
+	return fields
 }
 
 func formatPayloadDetail(payloadJSON, rawJSON string) string {
@@ -901,6 +951,8 @@ func RenderWithWidth(data Data, view string, width int) string {
 		writePayloadSummary(&b, data, width)
 		if data.Interaction != "" {
 			if data.Detail != "" {
+				writePayloadDetailFields(&b, data.DetailFields, width)
+				b.WriteString("\n")
 				b.WriteString("\nPayload\n")
 				b.WriteString(data.Detail)
 				if !strings.HasSuffix(data.Detail, "\n") {
@@ -1013,6 +1065,20 @@ func writeCommandRows(b *strings.Builder, rows []Row, width int) {
 			formatInt(row.SessionCount),
 			row.Directory,
 		})
+	}
+	columns := columnsForWidth(tableRows, width)
+	for _, row := range tableRows {
+		writeTableLine(b, columns, row)
+	}
+}
+
+func writePayloadDetailFields(b *strings.Builder, fields []Row, width int) {
+	if len(fields) == 0 {
+		return
+	}
+	tableRows := [][]string{{"Object", "Value"}}
+	for _, field := range fields {
+		tableRows = append(tableRows, []string{field.Label, field.Phase})
 	}
 	columns := columnsForWidth(tableRows, width)
 	for _, row := range tableRows {

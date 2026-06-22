@@ -85,6 +85,17 @@ func TestProgressBarsUseThemeAccent(t *testing.T) {
 	}
 }
 
+func TestMarkdownInlineCodeUsesTheme(t *testing.T) {
+	m := newTestModel(views.Data{})
+	rendered := m.themeMarkdown("run `agent-stats` now")
+	if strings.Contains(rendered, "`agent-stats`") {
+		t.Fatalf("expected markdown inline code ticks to be rendered away, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "agent-stats") {
+		t.Fatalf("expected markdown inline code content to remain, got %q", rendered)
+	}
+}
+
 func TestVimKeysScrollHorizontally(t *testing.T) {
 	m := newTestModel(views.Data{
 		View: "sessions",
