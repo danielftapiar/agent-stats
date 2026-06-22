@@ -2,9 +2,11 @@ package views
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,12 +31,14 @@ type Totals struct {
 }
 
 type Row struct {
+	ID                  int64  `json:"id,omitempty"`
 	Label               string `json:"label"`
 	PeriodStart         string `json:"period_start,omitempty"`
 	Directory           string `json:"directory,omitempty"`
 	Model               string `json:"model,omitempty"`
 	EventType           string `json:"event_type,omitempty"`
 	Phase               string `json:"phase,omitempty"`
+	CallID              string `json:"call_id,omitempty"`
 	Arguments           string `json:"arguments,omitempty"`
 	FunctionCalls       int64  `json:"function_calls,omitempty"`
 	SessionCount        int64  `json:"session_count,omitempty"`
@@ -62,6 +66,7 @@ type Data struct {
 	Interaction   string `json:"interaction,omitempty"`
 	SelectedIndex int    `json:"selected_index,omitempty"`
 	Summary       []Row  `json:"summary,omitempty"`
+	Detail        string `json:"detail,omitempty"`
 	GraphRows     []Row  `json:"graph_rows,omitempty"`
 	Totals        Totals `json:"totals"`
 	Rows          []Row  `json:"rows"`
@@ -147,6 +152,14 @@ func LoadSessionPayload(ctx context.Context, db *store.DB, sessionID string, lim
 }
 
 func LoadPayloadInteraction(ctx context.Context, db *store.DB, sessionID, interaction string) (Data, error) {
+	payloadID, err := strconv.ParseInt(interaction, 10, 64)
+	if err == nil && payloadID > 0 {
+		detail, err := queryPayloadDetail(ctx, db, sessionID, payloadID)
+		if err != nil {
+			return Data{}, err
+		}
+		return Data{View: "payload", Session: sessionID, Interaction: interaction, SelectedIndex: -1, Detail: detail}, nil
+	}
 	summary, err := queryInteractionSummary(ctx, db, sessionID, interaction)
 	if err != nil {
 		return Data{}, err
@@ -530,6 +543,62 @@ func previousInteraction(ctx context.Context, db *store.DB, sessionID, interacti
 	return previous, rows.Err()
 }
 
+func queryPayloadDetail(ctx context.Context, db *store.DB, sessionID string, payloadID int64) (string, error) {
+	payloadType, callID, payloadJSON, rawJSON, err := payloadDetailRow(ctx, db, `id = ? AND session_id = ?`, payloadID, sessionID)
+	if err != nil {
+		return "", err
+	}
+	if payloadType == "function_call" && callID != "" {
+		_, _, outputPayloadJSON, outputRawJSON, err := payloadDetailRow(ctx, db, `session_id = ? AND call_id = ? AND payload_type = 'function_call_output'`, sessionID, callID)
+		if err == nil && (outputPayloadJSON != "" || outputRawJSON != "") {
+			return formatPayloadDetail(outputPayloadJSON, outputRawJSON), nil
+		}
+	}
+	return formatPayloadDetail(payloadJSON, rawJSON), nil
+}
+
+func payloadDetailRow(ctx context.Context, db *store.DB, where string, args ...any) (string, string, string, string, error) {
+	query := `SELECT payload_type, call_id, payload_json, raw_json
+		FROM payload_events
+		WHERE ` + where + `
+		ORDER BY timestamp ASC, id ASC
+		LIMIT 1`
+	rows, err := db.Query(ctx, query, args...)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	defer rows.Close()
+	var payloadType, callID, payloadJSON, rawJSON string
+	if rows.Next() {
+		if err := rows.Scan(&payloadType, &callID, &payloadJSON, &rawJSON); err != nil {
+			return "", "", "", "", err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", "", "", err
+	}
+	return payloadType, callID, payloadJSON, rawJSON, nil
+}
+
+func formatPayloadDetail(payloadJSON, rawJSON string) string {
+	content := payloadJSON
+	if content == "" {
+		content = rawJSON
+	}
+	if content == "" {
+		return "No payload found."
+	}
+	var value any
+	if err := json.Unmarshal([]byte(content), &value); err == nil {
+		if rendered, err := json.MarshalIndent(value, "", "  "); err == nil {
+			content = string(rendered)
+		}
+	}
+	content = strings.ReplaceAll(content, `\n`, "\n")
+	content = strings.ReplaceAll(content, `\t`, "\t")
+	return content
+}
+
 func singlePayloadMetricArgs(ctx context.Context, db *store.DB, label, query string, args ...any) (Row, error) {
 	sqlRows, err := db.Query(ctx, query, args...)
 	if err != nil {
@@ -561,26 +630,29 @@ func singlePayloadMetric(ctx context.Context, db *store.DB, sessionID, label, qu
 }
 
 func querySessionResponses(ctx context.Context, db *store.DB, sessionID string, limit int) ([]Row, error) {
-	query := `SELECT payload_type,
+	query := `SELECT id,
+		CASE WHEN payload_type = 'message' AND role = 'assistant' THEN 'llm_response' ELSE payload_type END,
 		COALESCE(NULLIF(normalized_command, ''), NULLIF(command_name, ''), ''),
 		COALESCE(arguments, ''),
-		COUNT(*),
-		COALESCE(SUM(payload_bytes), 0),
-		COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0),
-		COALESCE(MAX(payload_bytes), 0),
-		COALESCE(SUM(arguments_bytes), 0),
-		COALESCE(SUM(response_output_bytes), 0),
-		COALESCE(CAST(AVG(response_output_bytes) AS INTEGER), 0),
-		COALESCE(MAX(response_output_bytes), 0),
-		COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0),
-		COALESCE(MAX(duration_ms), 0),
-		COALESCE(CAST(AVG(time_to_first_token_ms) AS INTEGER), 0),
-		COALESCE(MIN(timestamp), ''),
-		COALESCE(MAX(timestamp), '')
+		COALESCE(call_id, ''),
+		1,
+		payload_bytes,
+		payload_bytes,
+		payload_bytes,
+		arguments_bytes,
+		response_output_bytes,
+		response_output_bytes,
+		response_output_bytes,
+		duration_ms,
+		duration_ms,
+		time_to_first_token_ms,
+		timestamp,
+		timestamp
 		FROM payload_events
-		WHERE session_id = ? AND top_level_type = 'response_item'
-		GROUP BY payload_type, COALESCE(NULLIF(normalized_command, ''), NULLIF(command_name, ''), ''), COALESCE(arguments, '')
-		ORDER BY MAX(timestamp) DESC`
+		WHERE session_id = ?
+			AND top_level_type = 'response_item'
+			AND payload_type IN ('function_call', 'function_call_output', 'message')
+		ORDER BY timestamp DESC, id DESC`
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -593,9 +665,11 @@ func querySessionResponses(ctx context.Context, db *store.DB, sessionID string, 
 	for sqlRows.Next() {
 		var row Row
 		if err := sqlRows.Scan(
+			&row.ID,
 			&row.Label,
 			&row.Phase,
 			&row.Arguments,
+			&row.CallID,
 			&row.Count,
 			&row.PayloadBytes,
 			&row.AvgBytes,
@@ -826,6 +900,13 @@ func RenderWithWidth(data Data, view string, width int) string {
 	if view == "payload" {
 		writePayloadSummary(&b, data, width)
 		if data.Interaction != "" {
+			if data.Detail != "" {
+				b.WriteString("\nPayload\n")
+				b.WriteString(data.Detail)
+				if !strings.HasSuffix(data.Detail, "\n") {
+					b.WriteString("\n")
+				}
+			}
 			return b.String()
 		}
 		if len(data.Rows) == 0 {
@@ -951,7 +1032,7 @@ func writePayloadSummary(b *strings.Builder, data Data, width int) {
 	}
 	fmt.Fprintf(b, "Session: %s\n", data.Session)
 	if data.Interaction != "" {
-		fmt.Fprintf(b, "Interaction: %s\n", compactTime(data.Interaction))
+		fmt.Fprintf(b, "Payload: %s\n", compactTime(data.Interaction))
 	}
 	if len(data.Summary) == 0 {
 		return

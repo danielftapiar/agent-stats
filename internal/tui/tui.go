@@ -167,7 +167,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.inSessionPayload() && len(m.data.Rows) > 0 {
 				m.clampPayloadRow()
-				m.interaction = m.data.Rows[m.payloadRow].Label
+				m.interaction = fmt.Sprintf("%d", m.data.Rows[m.payloadRow].ID)
 				m.reload()
 				return m, nil
 			}
@@ -567,7 +567,7 @@ func (m model) contentWidth() int {
 }
 
 func (m model) inSessionPayload() bool {
-	return viewNames[m.active] == "payload" && m.session != "" && m.interaction != ""
+	return viewNames[m.active] == "payload" && m.session != ""
 }
 
 func (m *model) clampSummaryRow() {
