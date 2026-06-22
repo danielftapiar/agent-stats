@@ -428,9 +428,9 @@ func TestLoadPayloadSummariesAndSessionResponses(t *testing.T) {
 	}
 	payloads := []store.PayloadEvent{
 		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", TopLevelType: "event_msg", PayloadType: "agent_message", Phase: "commentary", PayloadBytes: 100},
-		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:00Z", TopLevelType: "response_item", PayloadType: "function_call", CommandName: "exec_command", NormalizedCommand: "sed", Arguments: `{"cmd":"rtk sed -n '1,20p' README.md"}`, ArgumentsBytes: 41, PayloadBytes: 200, DurationMS: 20},
-		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:20Z", TopLevelType: "response_item", PayloadType: "function_call_output", ResponseOutputBytes: 11, PayloadBytes: 160, DurationMS: 30},
-		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:30Z", TopLevelType: "response_item", PayloadType: "message", Role: "assistant", PayloadBytes: 150, InputTextCount: 1, InputTextBytes: 44, ResponseOutputBytes: 44},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:00Z", TopLevelType: "response_item", PayloadType: "function_call", CommandName: "exec_command", NormalizedCommand: "sed", Arguments: `{"cmd":"rtk sed -n '1,20p' README.md"}`, ArgumentsBytes: 41, PayloadBytes: 2048, DurationMS: 20},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:20Z", TopLevelType: "response_item", PayloadType: "function_call_output", ResponseOutputBytes: 4096, PayloadBytes: 4096, DurationMS: 30},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:30Z", TopLevelType: "response_item", PayloadType: "message", Role: "assistant", PayloadBytes: 3072, InputTextCount: 1, InputTextBytes: 44, ResponseOutputBytes: 2048},
 		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:02:00Z", TopLevelType: "event_msg", PayloadType: "token_count", PayloadBytes: 300, InputTokens: 10, CachedInputTokens: 5, OutputTokens: 4, ReasoningOutputTokens: 1, TotalTokens: 14},
 	}
 	if err := db.SaveFileSyncWithDetails(ctx, source, nil, nil, payloads); err != nil {
@@ -462,11 +462,11 @@ func TestLoadPayloadSummariesAndSessionResponses(t *testing.T) {
 	if len(session.Rows) != 3 {
 		t.Fatalf("expected 3 response aggregate rows, got %d", len(session.Rows))
 	}
-	if session.Rows[0].ResponseOutputBytes != 44 {
-		t.Fatalf("expected latest message response output bytes 44, got %d", session.Rows[0].ResponseOutputBytes)
+	if session.Rows[0].ResponseOutputBytes != 2048 {
+		t.Fatalf("expected latest message response output bytes 2048, got %d", session.Rows[0].ResponseOutputBytes)
 	}
 	renderedSession := Render(session, "payload")
-	for _, want := range []string{"Session: session-a", "command", "input_text", "role count", "Type", "Arguments", "Output Bytes", "function_call", "sed"} {
+	for _, want := range []string{"Session: session-a", "session_duration", "Avg Duration", "command", "input_text", "role count", "Function calls", "Type", "Arguments", "Output Bytes", "function_call", "sed", "2kb", "4kb"} {
 		if !strings.Contains(renderedSession, want) {
 			t.Fatalf("expected session payload drilldown to contain %q:\n%s", want, renderedSession)
 		}

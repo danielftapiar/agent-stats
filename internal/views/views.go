@@ -952,7 +952,7 @@ func writePayloadSummary(b *strings.Builder, data Data, width int) {
 			count += row.Count
 			bytes += row.PayloadBytes
 		}
-		fmt.Fprintf(b, "Payload groups: %d  Events: %s  Payload bytes: %s\n", len(data.Rows), formatInt(count), formatInt(bytes))
+		fmt.Fprintf(b, "Payload groups: %d  Events: %s  Payload bytes: %s\n", len(data.Rows), formatInt(count), formatBytes(bytes))
 		return
 	}
 	fmt.Fprintf(b, "Session: %s\n", data.Session)
@@ -962,24 +962,119 @@ func writePayloadSummary(b *strings.Builder, data Data, width int) {
 	if len(data.Summary) == 0 {
 		return
 	}
+	writeSessionPayloadSummary(b, data.Summary, width)
+}
+
+func writeSessionPayloadSummary(b *strings.Builder, rows []Row, width int) {
+	duration, metadata, commands := splitSessionSummaryRows(rows)
+	if width <= 0 {
+		width = tableWidth(columnsFor([][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT"}}))
+	}
+	gap := 2
+	leftWidth := width * 3 / 12
+	if leftWidth < 24 {
+		leftWidth = 24
+	}
+	rightWidth := width - leftWidth - gap
+	if rightWidth < 40 {
+		rightWidth = 40
+	}
+
+	left := renderDurationPanel(duration, leftWidth)
+	right := renderMetadataTable(metadata, rightWidth)
+	b.WriteString(joinColumns(left, right, gap))
+	b.WriteString("\n")
+
+	if len(commands) > 0 {
+		b.WriteString("Function calls\n")
+		b.WriteString(renderMetadataTable(commands, width))
+	}
+}
+
+func splitSessionSummaryRows(rows []Row) (Row, []Row, []Row) {
+	var duration Row
+	var metadata []Row
+	var commands []Row
+	for _, row := range rows {
+		switch row.Label {
+		case "session duration":
+			duration = row
+		case "command":
+			commands = append(commands, row)
+		default:
+			metadata = append(metadata, row)
+		}
+	}
+	return duration, metadata, commands
+}
+
+func renderDurationPanel(row Row, width int) string {
+	tableRows := [][]string{{"Metric", "Avg Duration"}}
+	tableRows = append(tableRows, []string{"session_duration", formatDuration(row.AvgDurationMS)})
+	return renderTable(tableRows, width)
+}
+
+func renderMetadataTable(rows []Row, width int) string {
 	tableRows := [][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT"}}
-	for _, row := range data.Summary {
+	for _, row := range rows {
 		tableRows = append(tableRows, []string{
 			truncate(row.Label, 26),
 			truncate(row.Phase, 12),
 			formatInt(row.Count),
-			formatInt(row.PayloadBytes),
-			formatInt(row.AvgBytes),
-			formatInt(row.MaxBytes),
+			formatBytes(row.PayloadBytes),
+			formatBytes(row.AvgBytes),
+			formatBytes(row.MaxBytes),
 			formatDuration(row.AvgDurationMS),
 			formatDuration(row.MaxDurationMS),
 			formatDuration(row.AvgTTFTMS),
 		})
 	}
+	return renderTable(tableRows, width)
+}
+
+func renderTable(tableRows [][]string, width int) string {
+	var b strings.Builder
 	columns := columnsForWidth(tableRows, width)
 	for _, row := range tableRows {
-		writeTableLine(b, columns, row)
+		writeTableLine(&b, columns, row)
 	}
+	return b.String()
+}
+
+func joinColumns(left, right string, gap int) string {
+	leftLines := strings.Split(strings.TrimRight(left, "\n"), "\n")
+	rightLines := strings.Split(strings.TrimRight(right, "\n"), "\n")
+	leftWidth := maxLineWidth(leftLines)
+	lineCount := len(leftLines)
+	if len(rightLines) > lineCount {
+		lineCount = len(rightLines)
+	}
+	var b strings.Builder
+	for i := 0; i < lineCount; i++ {
+		leftLine := ""
+		if i < len(leftLines) {
+			leftLine = leftLines[i]
+		}
+		rightLine := ""
+		if i < len(rightLines) {
+			rightLine = rightLines[i]
+		}
+		b.WriteString(padRight(leftLine, leftWidth))
+		b.WriteString(strings.Repeat(" ", gap))
+		b.WriteString(rightLine)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func maxLineWidth(lines []string) int {
+	var width int
+	for _, line := range lines {
+		if lineWidth := displayWidth(line); lineWidth > width {
+			width = lineWidth
+		}
+	}
+	return width
 }
 
 func writePayloadRows(b *strings.Builder, rows []Row, width int) {
@@ -989,9 +1084,9 @@ func writePayloadRows(b *strings.Builder, rows []Row, width int) {
 			truncate(row.Label, 30),
 			truncate(row.Phase, 12),
 			formatInt(row.Count),
-			formatInt(row.PayloadBytes),
-			formatInt(row.AvgBytes),
-			formatInt(row.MaxBytes),
+			formatBytes(row.PayloadBytes),
+			formatBytes(row.AvgBytes),
+			formatBytes(row.MaxBytes),
 			formatDuration(row.AvgDurationMS),
 			formatDuration(row.MaxDurationMS),
 			formatDuration(row.AvgTTFTMS),
@@ -1015,9 +1110,9 @@ func writePayloadSessionRows(b *strings.Builder, rows []Row, selectedIndex int, 
 			truncate(row.Phase, 18),
 			truncate(row.Arguments, 44),
 			formatInt(row.Count),
-			formatInt(row.ResponseOutputBytes),
-			formatInt(row.AvgResponseBytes),
-			formatInt(row.MaxResponseBytes),
+			formatBytes(row.ResponseOutputBytes),
+			formatBytes(row.AvgResponseBytes),
+			formatBytes(row.MaxResponseBytes),
 			formatDuration(row.AvgDurationMS),
 			formatDuration(row.MaxDurationMS),
 			formatDuration(row.AvgTTFTMS),
@@ -1194,7 +1289,7 @@ func tableColumnFor(header string) tableColumn {
 		return tableColumn{width: 13, align: alignCenter}
 	case "Payload Total", "Avg Bytes", "Max Bytes", "Avg Output", "Max Output":
 		return tableColumn{width: 10, align: alignCenter}
-	case "Avg Dur", "Max Dur", "Avg TTFT", "Dur", "TTFT":
+	case "Avg Duration", "Avg Dur", "Max Dur", "Avg TTFT", "Dur", "TTFT":
 		return tableColumn{width: 9, align: alignCenter}
 	case "Hit Rate":
 		return tableColumn{width: 10, align: alignCenter}
@@ -1381,6 +1476,27 @@ func formatCredits(n float64) string {
 		return trimCompactFloat(n)
 	}
 	return formatCompactFloat(n)
+}
+
+func formatBytes(n int64) string {
+	if n < 0 {
+		return "-" + formatBytes(-n)
+	}
+	units := []struct {
+		value  float64
+		suffix string
+	}{
+		{value: 1024 * 1024 * 1024, suffix: "gb"},
+		{value: 1024 * 1024, suffix: "mb"},
+		{value: 1024, suffix: "kb"},
+	}
+	value := float64(n)
+	for _, unit := range units {
+		if value >= unit.value {
+			return trimCompactFloat(value/unit.value) + unit.suffix
+		}
+	}
+	return fmt.Sprintf("%db", n)
 }
 
 func formatCompactFloat(n float64) string {
