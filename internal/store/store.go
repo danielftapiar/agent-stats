@@ -76,6 +76,9 @@ type PayloadEvent struct {
 	CommandName           string `json:"command_name,omitempty"`
 	NormalizedCommand     string `json:"normalized_command,omitempty"`
 	CallID                string `json:"call_id,omitempty"`
+	Arguments             string `json:"arguments,omitempty"`
+	ArgumentsBytes        int64  `json:"arguments_bytes,omitempty"`
+	ResponseOutputBytes   int64  `json:"response_output_bytes,omitempty"`
 	InputTokens           int64  `json:"input_tokens,omitempty"`
 	CachedInputTokens     int64  `json:"cached_input_tokens,omitempty"`
 	OutputTokens          int64  `json:"output_tokens,omitempty"`
@@ -197,6 +200,9 @@ func (db *DB) migrate(ctx context.Context) error {
 			command_name TEXT NOT NULL DEFAULT '',
 			normalized_command TEXT NOT NULL DEFAULT '',
 			call_id TEXT NOT NULL DEFAULT '',
+			arguments TEXT NOT NULL DEFAULT '',
+			arguments_bytes INTEGER NOT NULL DEFAULT 0,
+			response_output_bytes INTEGER NOT NULL DEFAULT 0,
 			input_tokens INTEGER NOT NULL DEFAULT 0,
 			cached_input_tokens INTEGER NOT NULL DEFAULT 0,
 			output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -212,6 +218,9 @@ func (db *DB) migrate(ctx context.Context) error {
 		`ALTER TABLE payload_events ADD COLUMN role TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE payload_events ADD COLUMN input_text_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE payload_events ADD COLUMN input_text_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE payload_events ADD COLUMN arguments TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE payload_events ADD COLUMN arguments_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE payload_events ADD COLUMN response_output_bytes INTEGER NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS payload_events_timestamp_idx ON payload_events(timestamp)`,
 		`CREATE INDEX IF NOT EXISTS payload_events_session_idx ON payload_events(session_id)`,
 		`CREATE INDEX IF NOT EXISTS payload_events_source_path_idx ON payload_events(source_path)`,
@@ -428,9 +437,10 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 			session_id, source_path, timestamp, top_level_type, payload_type, phase, payload_bytes,
 			content_bytes, role, input_text_count, input_text_bytes,
 			completed_at, duration_ms, time_to_first_token_ms, command_name, normalized_command, call_id,
+			arguments, arguments_bytes, response_output_bytes,
 			input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
 			model_context_window, model, payload_json, raw_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			payload.SessionID,
 			payload.SourcePath,
 			payload.Timestamp,
@@ -448,6 +458,9 @@ func (db *DB) SaveFileSyncWithDetails(ctx context.Context, source SourceFile, ev
 			payload.CommandName,
 			payload.NormalizedCommand,
 			payload.CallID,
+			payload.Arguments,
+			payload.ArgumentsBytes,
+			payload.ResponseOutputBytes,
 			payload.InputTokens,
 			payload.CachedInputTokens,
 			payload.OutputTokens,

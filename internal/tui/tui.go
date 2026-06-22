@@ -567,7 +567,7 @@ func (m model) contentWidth() int {
 }
 
 func (m model) inSessionPayload() bool {
-	return viewNames[m.active] == "payload" && m.session != ""
+	return viewNames[m.active] == "payload" && m.session != "" && m.interaction != ""
 }
 
 func (m *model) clampSummaryRow() {
@@ -640,7 +640,7 @@ func (m *model) deleteSession(sessionID string) {
 }
 
 func isTableHeader(line string) bool {
-	for _, prefix := range []string{"Group", "Week", "Day", "Command", "Payload", "Metric", "Interaction"} {
+	for _, prefix := range []string{"Group", "Week", "Day", "Command", "Payload", "Metric", "Interaction", "Type"} {
 		if strings.HasPrefix(line, prefix) {
 			return true
 		}

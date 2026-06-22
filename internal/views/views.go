@@ -29,24 +29,29 @@ type Totals struct {
 }
 
 type Row struct {
-	Label         string `json:"label"`
-	PeriodStart   string `json:"period_start,omitempty"`
-	Directory     string `json:"directory,omitempty"`
-	Model         string `json:"model,omitempty"`
-	EventType     string `json:"event_type,omitempty"`
-	Phase         string `json:"phase,omitempty"`
-	FunctionCalls int64  `json:"function_calls,omitempty"`
-	SessionCount  int64  `json:"session_count,omitempty"`
-	Count         int64  `json:"count,omitempty"`
-	PayloadBytes  int64  `json:"payload_bytes,omitempty"`
-	AvgBytes      int64  `json:"avg_bytes,omitempty"`
-	MaxBytes      int64  `json:"max_bytes,omitempty"`
-	AvgDurationMS int64  `json:"avg_duration_ms,omitempty"`
-	MaxDurationMS int64  `json:"max_duration_ms,omitempty"`
-	AvgTTFTMS     int64  `json:"avg_time_to_first_token_ms,omitempty"`
-	FirstSeen     string `json:"first_seen,omitempty"`
-	LastSeen      string `json:"last_seen,omitempty"`
-	Totals        Totals `json:"totals"`
+	Label               string `json:"label"`
+	PeriodStart         string `json:"period_start,omitempty"`
+	Directory           string `json:"directory,omitempty"`
+	Model               string `json:"model,omitempty"`
+	EventType           string `json:"event_type,omitempty"`
+	Phase               string `json:"phase,omitempty"`
+	Arguments           string `json:"arguments,omitempty"`
+	FunctionCalls       int64  `json:"function_calls,omitempty"`
+	SessionCount        int64  `json:"session_count,omitempty"`
+	Count               int64  `json:"count,omitempty"`
+	PayloadBytes        int64  `json:"payload_bytes,omitempty"`
+	AvgBytes            int64  `json:"avg_bytes,omitempty"`
+	MaxBytes            int64  `json:"max_bytes,omitempty"`
+	ArgumentsBytes      int64  `json:"arguments_bytes,omitempty"`
+	ResponseOutputBytes int64  `json:"response_output_bytes,omitempty"`
+	AvgResponseBytes    int64  `json:"avg_response_bytes,omitempty"`
+	MaxResponseBytes    int64  `json:"max_response_bytes,omitempty"`
+	AvgDurationMS       int64  `json:"avg_duration_ms,omitempty"`
+	MaxDurationMS       int64  `json:"max_duration_ms,omitempty"`
+	AvgTTFTMS           int64  `json:"avg_time_to_first_token_ms,omitempty"`
+	FirstSeen           string `json:"first_seen,omitempty"`
+	LastSeen            string `json:"last_seen,omitempty"`
+	Totals              Totals `json:"totals"`
 }
 
 type Data struct {
@@ -129,7 +134,7 @@ func LoadSessionsForDay(ctx context.Context, db *store.DB, day string, limit int
 }
 
 func LoadSessionPayload(ctx context.Context, db *store.DB, sessionID string, limit int) (Data, error) {
-	rows, err := querySessionInteractions(ctx, db, sessionID, limitOrDefault(limit))
+	rows, err := querySessionResponses(ctx, db, sessionID, limitOrDefault(limit))
 	if err != nil {
 		return Data{}, err
 	}
@@ -138,10 +143,6 @@ func LoadSessionPayload(ctx context.Context, db *store.DB, sessionID string, lim
 		return Data{}, err
 	}
 	data := Data{View: "payload", Session: sessionID, SelectedIndex: -1, Summary: summary, Rows: rows}
-	for _, row := range rows {
-		data.Totals = addTotals(data.Totals, row.Totals)
-	}
-	data.Totals.CacheHitRate = cacheHitRate(data.Totals)
 	return data, nil
 }
 
@@ -422,7 +423,10 @@ func queryTopCommands(ctx context.Context, db *store.DB, sessionID, startAfter, 
 		where += " AND timestamp > ?"
 		args = append(args, startAfter)
 	}
-	query := `SELECT 'top command', COALESCE(NULLIF(normalized_command, ''), command_name), COUNT(*), 0, 0, 0, 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '')
+	query := `SELECT 'command', COALESCE(NULLIF(normalized_command, ''), command_name), COUNT(*),
+		COALESCE(SUM(arguments_bytes), 0), COALESCE(CAST(AVG(arguments_bytes) AS INTEGER), 0), COALESCE(MAX(arguments_bytes), 0),
+		COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0), COALESCE(MAX(duration_ms), 0), 0,
+		COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '')
 		FROM payload_events
 		WHERE ` + where + `
 		GROUP BY COALESCE(NULLIF(normalized_command, ''), command_name)
@@ -562,13 +566,27 @@ func singlePayloadMetric(ctx context.Context, db *store.DB, sessionID, label, qu
 	return row, sqlRows.Err()
 }
 
-func querySessionInteractions(ctx context.Context, db *store.DB, sessionID string, limit int) ([]Row, error) {
-	query := `SELECT timestamp,
-		input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-		payload_bytes, duration_ms, time_to_first_token_ms
+func querySessionResponses(ctx context.Context, db *store.DB, sessionID string, limit int) ([]Row, error) {
+	query := `SELECT payload_type,
+		COALESCE(NULLIF(normalized_command, ''), NULLIF(command_name, ''), ''),
+		COALESCE(arguments, ''),
+		COUNT(*),
+		COALESCE(SUM(payload_bytes), 0),
+		COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0),
+		COALESCE(MAX(payload_bytes), 0),
+		COALESCE(SUM(arguments_bytes), 0),
+		COALESCE(SUM(response_output_bytes), 0),
+		COALESCE(CAST(AVG(response_output_bytes) AS INTEGER), 0),
+		COALESCE(MAX(response_output_bytes), 0),
+		COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0),
+		COALESCE(MAX(duration_ms), 0),
+		COALESCE(CAST(AVG(time_to_first_token_ms) AS INTEGER), 0),
+		COALESCE(MIN(timestamp), ''),
+		COALESCE(MAX(timestamp), '')
 		FROM payload_events
-		WHERE session_id = ? AND payload_type = 'token_count'
-		ORDER BY timestamp DESC`
+		WHERE session_id = ? AND top_level_type = 'response_item'
+		GROUP BY payload_type, COALESCE(NULLIF(normalized_command, ''), NULLIF(command_name, ''), ''), COALESCE(arguments, '')
+		ORDER BY MAX(timestamp) DESC`
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -580,10 +598,26 @@ func querySessionInteractions(ctx context.Context, db *store.DB, sessionID strin
 	var rows []Row
 	for sqlRows.Next() {
 		var row Row
-		if err := sqlRows.Scan(&row.Label, &row.Totals.InputTokens, &row.Totals.CachedInputTokens, &row.Totals.OutputTokens, &row.Totals.ReasoningOutputTokens, &row.Totals.TotalTokens, &row.PayloadBytes, &row.AvgDurationMS, &row.AvgTTFTMS); err != nil {
+		if err := sqlRows.Scan(
+			&row.Label,
+			&row.Phase,
+			&row.Arguments,
+			&row.Count,
+			&row.PayloadBytes,
+			&row.AvgBytes,
+			&row.MaxBytes,
+			&row.ArgumentsBytes,
+			&row.ResponseOutputBytes,
+			&row.AvgResponseBytes,
+			&row.MaxResponseBytes,
+			&row.AvgDurationMS,
+			&row.MaxDurationMS,
+			&row.AvgTTFTMS,
+			&row.FirstSeen,
+			&row.LastSeen,
+		); err != nil {
 			return nil, err
 		}
-		row.Totals = withDerived(row.Totals)
 		rows = append(rows, row)
 	}
 	return rows, sqlRows.Err()
@@ -801,7 +835,11 @@ func RenderWithWidth(data Data, view string, width int) string {
 			return b.String()
 		}
 		if len(data.Rows) == 0 {
-			b.WriteString("\nNo payload events found.\n")
+			if data.Session != "" {
+				b.WriteString("\nNo response items found.\n")
+			} else {
+				b.WriteString("\nNo payload events found.\n")
+			}
 			return b.String()
 		}
 		b.WriteString("\n")
@@ -966,23 +1004,23 @@ func writePayloadRows(b *strings.Builder, rows []Row, width int) {
 }
 
 func writePayloadSessionRows(b *strings.Builder, rows []Row, selectedIndex int, width int) {
-	tableRows := [][]string{{"Interaction", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Payload Bytes", "Dur", "TTFT", "Hit Rate"}}
+	tableRows := [][]string{{"Type", "Command", "Arguments", "Count", "Output Bytes", "Avg Output", "Max Output", "Avg Dur", "Max Dur", "Avg TTFT"}}
 	for i, row := range rows {
-		label := compactTime(row.Label)
+		label := row.Label
 		if i == selectedIndex {
 			label = selectedRowMarker + label
 		}
 		tableRows = append(tableRows, []string{
-			label,
-			formatInt(row.Totals.TotalTokens),
-			formatInt(row.Totals.UncachedInputTokens),
-			formatInt(row.Totals.CacheReadInputTokens),
-			formatInt(row.Totals.OutputTokens),
-			formatInt(row.Totals.ReasoningOutputTokens),
-			formatInt(row.PayloadBytes),
+			truncate(label, 18),
+			truncate(row.Phase, 18),
+			truncate(row.Arguments, 44),
+			formatInt(row.Count),
+			formatInt(row.ResponseOutputBytes),
+			formatInt(row.AvgResponseBytes),
+			formatInt(row.MaxResponseBytes),
 			formatDuration(row.AvgDurationMS),
+			formatDuration(row.MaxDurationMS),
 			formatDuration(row.AvgTTFTMS),
-			fmt.Sprintf("%.1f%%", row.Totals.CacheHitRate*100),
 		})
 	}
 	columns := columnsForWidth(tableRows, width)
@@ -1122,6 +1160,10 @@ func tableColumnFor(header string) tableColumn {
 	switch header {
 	case "Command":
 		return tableColumn{width: 28, align: alignLeft}
+	case "Type":
+		return tableColumn{width: 18, align: alignLeft}
+	case "Arguments":
+		return tableColumn{width: 44, align: alignLeft}
 	case "Payload":
 		return tableColumn{width: 30, align: alignLeft}
 	case "Metric":
@@ -1148,9 +1190,9 @@ func tableColumnFor(header string) tableColumn {
 		return tableColumn{width: 10, align: alignCenter}
 	case "Budget":
 		return tableColumn{width: 32, align: alignCenter}
-	case "Payload Bytes":
+	case "Output Bytes", "Payload Bytes":
 		return tableColumn{width: 13, align: alignCenter}
-	case "Payload Total", "Avg Bytes", "Max Bytes":
+	case "Payload Total", "Avg Bytes", "Max Bytes", "Avg Output", "Max Output":
 		return tableColumn{width: 10, align: alignCenter}
 	case "Avg Dur", "Max Dur", "Avg TTFT", "Dur", "TTFT":
 		return tableColumn{width: 9, align: alignCenter}
