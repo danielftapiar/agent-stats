@@ -368,12 +368,6 @@ func querySessionPayloadSummary(ctx context.Context, db *store.DB, sessionID str
 		row.AvgDurationMS = diffMillis(row.FirstSeen, row.LastSeen)
 		rows = append(rows, row)
 	}
-	if row, err := singlePayloadMetric(ctx, db, sessionID, "prompt-final", `SELECT 'prompt to final answer', '', 1, 0, 0, 0, 0, 0, 0, COALESCE(MIN(CASE WHEN top_level_type = 'event_msg' THEN timestamp END), ''), COALESCE(MAX(CASE WHEN top_level_type = 'response_item' AND payload_type = 'message' THEN timestamp END), '') FROM payload_events WHERE session_id = ?`); err != nil {
-		return nil, err
-	} else {
-		row.AvgDurationMS = diffMillis(row.FirstSeen, row.LastSeen)
-		rows = append(rows, row)
-	}
 	if row, err := singlePayloadMetric(ctx, db, sessionID, "response_item timing", `SELECT 'response_item timing', '', COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0), COALESCE(MAX(payload_bytes), 0), COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0), COALESCE(MAX(duration_ms), 0), COALESCE(CAST(AVG(time_to_first_token_ms) AS INTEGER), 0), COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? AND top_level_type = 'response_item'`); err != nil {
 		return nil, err
 	} else {
@@ -968,7 +962,7 @@ func writePayloadSummary(b *strings.Builder, data Data, width int) {
 func writeSessionPayloadSummary(b *strings.Builder, rows []Row, width int) {
 	duration, metadata, commands := splitSessionSummaryRows(rows)
 	if width <= 0 {
-		width = tableWidth(columnsFor([][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT"}}))
+		width = tableWidth(columnsFor([][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes"}}))
 	}
 	gap := 2
 	leftWidth := width * 3 / 12
@@ -981,13 +975,13 @@ func writeSessionPayloadSummary(b *strings.Builder, rows []Row, width int) {
 	}
 
 	left := renderDurationPanel(duration, leftWidth)
-	right := renderMetadataTable(metadata, rightWidth)
+	right := renderMetadataTable(metadata, rightWidth, false)
 	b.WriteString(joinColumns(left, right, gap))
 	b.WriteString("\n")
 
 	if len(commands) > 0 {
 		b.WriteString("Function calls\n")
-		b.WriteString(renderMetadataTable(commands, width))
+		b.WriteString(renderMetadataTable(commands, width, true))
 	}
 }
 
@@ -1014,20 +1008,29 @@ func renderDurationPanel(row Row, width int) string {
 	return renderTable(tableRows, width)
 }
 
-func renderMetadataTable(rows []Row, width int) string {
-	tableRows := [][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT"}}
+func renderMetadataTable(rows []Row, width int, includeTiming bool) string {
+	headers := []string{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes"}
+	if includeTiming {
+		headers = append(headers, "Avg Dur", "Max Dur", "Avg TTFT")
+	}
+	tableRows := [][]string{headers}
 	for _, row := range rows {
-		tableRows = append(tableRows, []string{
+		values := []string{
 			truncate(row.Label, 26),
 			truncate(row.Phase, 12),
 			formatInt(row.Count),
 			formatBytes(row.PayloadBytes),
 			formatBytes(row.AvgBytes),
 			formatBytes(row.MaxBytes),
-			formatDuration(row.AvgDurationMS),
-			formatDuration(row.MaxDurationMS),
-			formatDuration(row.AvgTTFTMS),
-		})
+		}
+		if includeTiming {
+			values = append(values,
+				formatDuration(row.AvgDurationMS),
+				formatDuration(row.MaxDurationMS),
+				formatDuration(row.AvgTTFTMS),
+			)
+		}
+		tableRows = append(tableRows, values)
 	}
 	return renderTable(tableRows, width)
 }

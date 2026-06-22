@@ -474,6 +474,16 @@ func TestLoadPayloadSummariesAndSessionResponses(t *testing.T) {
 	if strings.Contains(renderedSession, "Interaction") {
 		t.Fatalf("expected session payload drilldown to omit interaction list:\n%s", renderedSession)
 	}
+	if strings.Contains(renderedSession, "prompt to final answer") {
+		t.Fatalf("expected session payload metadata to omit prompt-final metric:\n%s", renderedSession)
+	}
+	topMetadata := strings.Split(renderedSession, "Function calls")[0]
+	if strings.Contains(topMetadata, "Max Dur") || strings.Contains(topMetadata, "Avg TTFT") {
+		t.Fatalf("expected right-side session metadata to omit timing columns:\n%s", renderedSession)
+	}
+	if !strings.Contains(renderedSession, "Function calls") || !strings.Contains(renderedSession, "Avg Dur") {
+		t.Fatalf("expected function calls section to keep timing columns:\n%s", renderedSession)
+	}
 }
 
 func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
