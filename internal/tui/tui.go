@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,10 +22,7 @@ type tickMsg time.Time
 var viewNames = []string{
 	"summary",
 	"today",
-	"daily",
 	"sessions",
-	"cache",
-	"reasoning",
 	"commands",
 	"payload",
 	"tokens",
@@ -32,27 +30,32 @@ var viewNames = []string{
 }
 
 type model struct {
-	ctx         context.Context
-	db          *store.DB
-	indexer     *codex.Indexer
-	active      int
-	input       textinput.Model
-	viewport    viewport.Model
-	prompt      bool
-	picker      bool
-	err         string
-	data        views.Data
-	width       int
-	height      int
-	lastSync    time.Time
-	theme       theme
-	themes      []namedTheme
-	selected    int
-	preview     int
-	row         int
-	payloadRow  int
-	session     string
-	interaction string
+	ctx           context.Context
+	db            *store.DB
+	indexer       *codex.Indexer
+	active        int
+	input         textinput.Model
+	viewport      viewport.Model
+	prompt        bool
+	picker        bool
+	confirmDelete bool
+	err           string
+	data          views.Data
+	width         int
+	height        int
+	lastSync      time.Time
+	theme         theme
+	themes        []namedTheme
+	selected      int
+	preview       int
+	summaryRow    int
+	row           int
+	payloadRow    int
+	session       string
+	interaction   string
+	summaryWeek   string
+	sessionsDay   string
+	pendingDelete string
 }
 
 func Run(ctx context.Context, db *store.DB, indexer *codex.Indexer) error {
@@ -80,6 +83,7 @@ func newModel(ctx context.Context, db *store.DB, indexer *codex.Indexer) model {
 		theme:    t,
 		themes:   themes,
 	}
+	m.viewport.SetHorizontalStep(8)
 	m.reload()
 	return m
 }
@@ -106,6 +110,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tick()
 	case tea.KeyMsg:
+		if m.confirmDelete {
+			return m.updateDeleteConfirm(msg)
+		}
 		if m.picker {
 			return m.updateThemePicker(msg)
 		}
@@ -124,6 +131,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = commandHelp()
 			return m, nil
 		case "enter":
+			if viewNames[m.active] == "summary" && len(m.data.Rows) > 0 {
+				m.clampSummaryRow()
+				if m.summaryWeek == "" {
+					m.summaryWeek = m.data.Rows[m.summaryRow].PeriodStart
+					m.summaryRow = 0
+				} else {
+					m.sessionsDay = m.data.Rows[m.summaryRow].PeriodStart
+					m.summaryWeek = ""
+					m.summaryRow = 0
+					m.row = 0
+					if idx := viewIndex("sessions"); idx >= 0 {
+						m.active = idx
+					}
+				}
+				m.reload()
+				return m, nil
+			}
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
 				if m.row < 0 {
 					m.row = 0
@@ -148,6 +172,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "esc", "backspace":
+			if viewNames[m.active] == "summary" && m.summaryWeek != "" {
+				m.summaryWeek = ""
+				m.reload()
+				return m, nil
+			}
+			if viewNames[m.active] == "sessions" && m.sessionsDay != "" {
+				m.sessionsDay = ""
+				m.reload()
+				return m, nil
+			}
 			if viewNames[m.active] == "payload" && m.interaction != "" {
 				m.interaction = ""
 				m.reload()
@@ -155,10 +189,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
-				m.deleteSelectedSession()
+				m.startDeleteConfirmation()
 				return m, nil
 			}
+		case "l":
+			m.viewport.ScrollRight(8)
+			return m, nil
+		case "h":
+			m.viewport.ScrollLeft(8)
+			return m, nil
 		case "j", "down":
+			if viewNames[m.active] == "summary" && len(m.data.Rows) > 0 {
+				m.summaryRow++
+				m.clampSummaryRow()
+				m.setViewportContent()
+				return m, nil
+			}
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
 				m.row++
 				if m.row >= len(m.data.Rows) {
@@ -174,6 +220,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "k", "up":
+			if viewNames[m.active] == "summary" && len(m.data.Rows) > 0 {
+				m.summaryRow--
+				m.clampSummaryRow()
+				m.setViewportContent()
+				return m, nil
+			}
 			if viewNames[m.active] == "sessions" && len(m.data.Rows) > 0 {
 				m.row--
 				if m.row < 0 {
@@ -192,6 +244,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.active = (m.active + 1) % len(viewNames)
 			m.session = ""
 			m.interaction = ""
+			m.summaryWeek = ""
+			m.sessionsDay = ""
 			m.reload()
 			return m, nil
 		case "shift+tab":
@@ -201,6 +255,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.session = ""
 			m.interaction = ""
+			m.summaryWeek = ""
+			m.sessionsDay = ""
 			m.reload()
 			return m, nil
 		}
@@ -212,6 +268,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.active = next
 					m.session = ""
 					m.interaction = ""
+					m.summaryWeek = ""
+					m.sessionsDay = ""
 					m.reload()
 				}
 			}
@@ -251,6 +309,10 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.session = ""
 				m.interaction = ""
 			}
+			if value != "summary" {
+				m.summaryWeek = ""
+			}
+			m.sessionsDay = ""
 			m.err = ""
 			m.reload()
 		} else if value == "help" {
@@ -265,8 +327,31 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) updateDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.cancelDeleteConfirmation()
+		return m, nil
+	case "enter":
+		value := strings.TrimSpace(strings.ToLower(m.input.Value()))
+		sessionID := m.pendingDelete
+		m.cancelDeleteConfirmation()
+		if value == "yes" {
+			m.deleteSession(sessionID)
+		} else {
+			m.err = fmt.Sprintf("delete cancelled for %s", sessionID)
+		}
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
 func commandHelp() string {
-	return "commands: :summary :today :daily :sessions :cache :reasoning :commands :payload :tokens :top :theme :quit"
+	return "commands: :summary :today :sessions :commands :payload :tokens :top :theme :quit"
 }
 
 func (m model) updateThemePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -306,7 +391,11 @@ func (m *model) reload() {
 		data views.Data
 		err  error
 	)
-	if viewNames[m.active] == "payload" && m.session != "" {
+	if viewNames[m.active] == "summary" && m.summaryWeek != "" {
+		data, err = views.LoadSummaryWeek(m.ctx, m.db, m.summaryWeek)
+	} else if viewNames[m.active] == "sessions" && m.sessionsDay != "" {
+		data, err = views.LoadSessionsForDay(m.ctx, m.db, m.sessionsDay, 20)
+	} else if viewNames[m.active] == "payload" && m.session != "" {
 		if m.interaction != "" {
 			data, err = views.LoadPayloadInteraction(m.ctx, m.db, m.session, m.interaction)
 		} else {
@@ -327,6 +416,15 @@ func (m *model) reload() {
 			m.row = 0
 		}
 		data.SelectedIndex = m.row
+	}
+	if viewNames[m.active] == "summary" {
+		if m.summaryRow >= len(data.Rows) {
+			m.summaryRow = len(data.Rows) - 1
+		}
+		if m.summaryRow < 0 {
+			m.summaryRow = 0
+		}
+		data.SelectedIndex = m.summaryRow
 	}
 	if m.inSessionPayload() && m.interaction == "" {
 		if m.payloadRow >= len(data.Rows) {
@@ -352,10 +450,13 @@ func (m *model) configureViewport() {
 	}
 	m.viewport.Width = contentWidth
 	m.viewport.Height = contentHeight
+	m.viewport.SetHorizontalStep(8)
 }
 
 func (m *model) setViewportContent() {
-	m.viewport.SetContent(m.renderContent())
+	raw := m.renderPlainContent()
+	m.viewport.SetContent(m.themeContent(raw))
+	m.keepSelectedLineVisible(raw)
 }
 
 func (m *model) applyThemeToInput() {
@@ -381,22 +482,46 @@ func (m model) View() string {
 	}
 	if m.picker {
 		b.WriteString(m.renderThemePicker())
+	} else if m.confirmDelete {
+		b.WriteString(m.input.View())
 	} else if m.prompt {
 		b.WriteString(m.input.View())
 	} else {
-		b.WriteString(m.theme.Help.Render("Press : for commands, :theme for themes, arrows/PageUp/PageDown to scroll, q to quit"))
+		b.WriteString(m.theme.Help.Render("Press : for commands, :theme for themes, h/l or arrows to scroll, q to quit"))
 	}
 	return m.theme.Frame.Render(b.String())
 }
 
 func (m model) renderContent() string {
+	return m.themeContent(m.renderPlainContent())
+}
+
+func (m model) renderPlainContent() string {
 	if viewNames[m.active] == "sessions" {
 		m.data.SelectedIndex = m.row
+	}
+	if viewNames[m.active] == "summary" {
+		m.data.SelectedIndex = m.summaryRow
 	}
 	if m.inSessionPayload() && m.interaction == "" {
 		m.data.SelectedIndex = m.payloadRow
 	}
-	return m.themeContent(views.Render(m.data, viewNames[m.active]))
+	return views.RenderWithWidth(m.data, viewNames[m.active], m.contentWidth())
+}
+
+func (m *model) keepSelectedLineVisible(raw string) {
+	lineIndex := selectedLineIndex(raw)
+	if lineIndex < 0 || m.viewport.Height <= 0 {
+		return
+	}
+	if lineIndex < m.viewport.YOffset {
+		m.viewport.YOffset = lineIndex
+		return
+	}
+	bottom := m.viewport.YOffset + m.viewport.Height - 1
+	if lineIndex > bottom {
+		m.viewport.YOffset = lineIndex - m.viewport.Height + 1
+	}
 }
 
 func (m model) themeContent(content string) string {
@@ -412,16 +537,46 @@ func (m model) themeContent(content string) string {
 		case isTableHeader(line):
 			lines[i] = m.theme.TableHeader.Render(line)
 		case isSelectedLine(line):
-			lines[i] = m.theme.ActiveTab.Width(lipgloss.Width(line)).Render(line)
+			cleanLine := stripSelectedLineMarker(line)
+			lines[i] = m.theme.SelectedRow.Width(m.selectedRowWidth(cleanLine)).Render(cleanLine)
 		case strings.ContainsAny(line, "┤┼╭╮╯╰─│"):
 			lines[i] = m.theme.Graph.Render(line)
+		default:
+			lines[i] = m.themeProgressBars(line)
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
+func (m model) selectedRowWidth(line string) int {
+	width := lipgloss.Width(line)
+	if contentWidth := m.contentWidth(); width < contentWidth {
+		return contentWidth
+	}
+	return width
+}
+
+func (m model) contentWidth() int {
+	if m.viewport.Width > 0 {
+		return m.viewport.Width
+	}
+	if m.width > frameHorizontalSize {
+		return m.width - frameHorizontalSize
+	}
+	return 80
+}
+
 func (m model) inSessionPayload() bool {
 	return viewNames[m.active] == "payload" && m.session != ""
+}
+
+func (m *model) clampSummaryRow() {
+	if m.summaryRow >= len(m.data.Rows) {
+		m.summaryRow = len(m.data.Rows) - 1
+	}
+	if m.summaryRow < 0 {
+		m.summaryRow = 0
+	}
 }
 
 func (m *model) clampPayloadRow() {
@@ -433,7 +588,7 @@ func (m *model) clampPayloadRow() {
 	}
 }
 
-func (m *model) deleteSelectedSession() {
+func (m *model) startDeleteConfirmation() {
 	if len(m.data.Rows) == 0 {
 		return
 	}
@@ -444,6 +599,24 @@ func (m *model) deleteSelectedSession() {
 		m.row = len(m.data.Rows) - 1
 	}
 	sessionID := strings.TrimPrefix(m.data.Rows[m.row].Label, "> ")
+	m.pendingDelete = sessionID
+	m.confirmDelete = true
+	m.input.Focus()
+	m.input.SetValue("")
+	m.input.Prompt = fmt.Sprintf("delete %s? type yes: ", sessionID)
+	m.err = ""
+}
+
+func (m *model) cancelDeleteConfirmation() {
+	m.confirmDelete = false
+	m.pendingDelete = ""
+	m.input.SetValue("")
+	m.input.Blur()
+	m.input.Prompt = ":"
+	m.applyThemeToInput()
+}
+
+func (m *model) deleteSession(sessionID string) {
 	paths, err := m.db.SessionSourcePaths(m.ctx, sessionID)
 	if err != nil {
 		m.err = err.Error()
@@ -462,11 +635,12 @@ func (m *model) deleteSelectedSession() {
 	m.err = fmt.Sprintf("deleted session %s", sessionID)
 	m.session = ""
 	m.interaction = ""
+	m.sessionsDay = ""
 	m.reload()
 }
 
 func isTableHeader(line string) bool {
-	for _, prefix := range []string{"Group", "Week", "Command", "Payload", "Metric", "Interaction"} {
+	for _, prefix := range []string{"Group", "Week", "Day", "Command", "Payload", "Metric", "Interaction"} {
 		if strings.HasPrefix(line, prefix) {
 			return true
 		}
@@ -475,8 +649,32 @@ func isTableHeader(line string) bool {
 }
 
 func isSelectedLine(line string) bool {
-	return strings.HasPrefix(strings.TrimLeft(line, " "), "> ")
+	return strings.HasPrefix(strings.TrimLeft(line, " "), selectedRowMarker)
 }
+
+func selectedLineIndex(content string) int {
+	for i, line := range strings.Split(content, "\n") {
+		if isSelectedLine(line) {
+			return i
+		}
+	}
+	return -1
+}
+
+func stripSelectedLineMarker(line string) string {
+	prefixLen := len(line) - len(strings.TrimLeft(line, " "))
+	return line[:prefixLen] + strings.TrimPrefix(line[prefixLen:], selectedRowMarker)
+}
+
+func (m model) themeProgressBars(line string) string {
+	return progressGlyphPattern.ReplaceAllStringFunc(line, func(match string) string {
+		return m.theme.Progress.Render(match)
+	})
+}
+
+const selectedRowMarker = "\x1f"
+
+var progressGlyphPattern = regexp.MustCompile(`[█░]+`)
 
 func (m model) renderThemePicker() string {
 	var b strings.Builder

@@ -10,7 +10,7 @@ import (
 	"github.com/danieltapia/agent-stats/internal/store"
 )
 
-func TestLoadDailyAggregatesTokenEvents(t *testing.T) {
+func TestLoadTodayAggregatesTokenEvents(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
 	if err != nil {
@@ -48,15 +48,15 @@ func TestLoadDailyAggregatesTokenEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := Load(ctx, db, "daily", 20, time.Now())
+	data, err := Load(ctx, db, "today", 20, time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(data.Rows) != 1 {
-		t.Fatalf("expected 1 daily row, got %d", len(data.Rows))
+		t.Fatalf("expected 1 today row, got %d", len(data.Rows))
 	}
-	if data.Rows[0].Label != "2026-06-20" {
-		t.Fatalf("expected 2026-06-20 row, got %q", data.Rows[0].Label)
+	if data.Rows[0].Label != "session-a" {
+		t.Fatalf("expected session-a row, got %q", data.Rows[0].Label)
 	}
 	if data.Rows[0].Totals.TotalTokens != 45 {
 		t.Fatalf("expected 45 total tokens, got %d", data.Rows[0].Totals.TotalTokens)
@@ -69,6 +69,29 @@ func TestLoadDailyAggregatesTokenEvents(t *testing.T) {
 	}
 	if data.Rows[0].Totals.CacheReadInputTokens != 60 {
 		t.Fatalf("expected cache read tokens 60, got %d", data.Rows[0].Totals.CacheReadInputTokens)
+	}
+	if len(data.GraphRows) != 24 {
+		t.Fatalf("expected 24 hourly graph rows, got %d", len(data.GraphRows))
+	}
+	if data.GraphRows[0].Label != "00:00" || data.GraphRows[23].Label != "23:59" {
+		t.Fatalf("expected graph to span 00:00 through 23:00, got first=%q last=%q", data.GraphRows[0].Label, data.GraphRows[23].Label)
+	}
+	if data.GraphRows[10].Totals.TotalTokens != 15 || data.GraphRows[11].Totals.TotalTokens != 30 {
+		t.Fatalf("expected hourly token totals at 10:00 and 11:00, got %d and %d", data.GraphRows[10].Totals.TotalTokens, data.GraphRows[11].Totals.TotalTokens)
+	}
+}
+
+func TestWithDerivedTreatsCachedInputAsInputSubset(t *testing.T) {
+	totals := withDerived(Totals{
+		InputTokens:       1_000,
+		CachedInputTokens: 750,
+	})
+
+	if totals.UncachedInputTokens != 250 {
+		t.Fatalf("expected uncached input to be input-cached, got %d", totals.UncachedInputTokens)
+	}
+	if totals.CacheHitRate != 0.75 {
+		t.Fatalf("expected cache hit rate 0.75, got %f", totals.CacheHitRate)
 	}
 }
 
@@ -131,13 +154,13 @@ func TestLoadSummaryGroupsWeeklyCreditsAndFunctionCalls(t *testing.T) {
 		SessionDir:        "/Users/example/project",
 		Model:             "gpt-5.5",
 		FunctionCallCount: 1,
-		LastSeenAt:        "2026-06-20T10:00:00Z",
+		LastSeenAt:        "2026-05-18T10:00:00Z",
 	}
 	events := []store.TokenEvent{
-		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", InputTokens: 1_000_000, CachedInputTokens: 1_000_000, OutputTokens: 500_000, ReasoningOutputTokens: 250_000, TotalTokens: 1_500_000, Model: "gpt-5.5"},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-18T10:00:00Z", InputTokens: 1_000_000, CachedInputTokens: 1_000_000, OutputTokens: 500_000, ReasoningOutputTokens: 250_000, TotalTokens: 1_500_000, Model: "gpt-5.5"},
 	}
 	commands := []store.CommandEvent{
-		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", EventType: "function_call", CommandName: "exec_command", SessionDir: "/Users/example/project"},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-18T10:00:00Z", EventType: "function_call", CommandName: "exec_command", SessionDir: "/Users/example/project"},
 	}
 	if err := db.SaveFileSyncWithCommands(ctx, source, events, commands); err != nil {
 		t.Fatal(err)
@@ -150,11 +173,63 @@ func TestLoadSummaryGroupsWeeklyCreditsAndFunctionCalls(t *testing.T) {
 	if len(data.Rows) != 1 {
 		t.Fatalf("expected 1 weekly summary row, got %d", len(data.Rows))
 	}
+	if data.Rows[0].Label != "2026 May 18th" {
+		t.Fatalf("expected Monday week label 2026 May 18th, got %q", data.Rows[0].Label)
+	}
 	if data.Rows[0].FunctionCalls != 1 {
 		t.Fatalf("expected 1 function call, got %d", data.Rows[0].FunctionCalls)
 	}
-	if data.Rows[0].Totals.Credits != 4.25 {
-		t.Fatalf("expected 4.25 credits, got %f", data.Rows[0].Totals.Credits)
+	if data.Rows[0].Totals.Credits != 80.5 {
+		t.Fatalf("expected 80.5 credits, got %f", data.Rows[0].Totals.Credits)
+	}
+}
+
+func TestLoadSummaryWeekGroupsDaysWithGraph(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	source := store.SourceFile{
+		Path:            "source.jsonl",
+		SizeBytes:       10,
+		ModTimeUnix:     1,
+		ProcessedOffset: 10,
+		SessionID:       "session-a",
+		Model:           "gpt-5.5",
+	}
+	events := []store.TokenEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-18T10:00:00Z", InputTokens: 1_000_000, CachedInputTokens: 900_000, OutputTokens: 10_000, TotalTokens: 1_010_000, Model: "gpt-5.5"},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-19T10:00:00Z", InputTokens: 2_000_000, CachedInputTokens: 1_500_000, OutputTokens: 20_000, TotalTokens: 2_020_000, Model: "gpt-5.5"},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-25T10:00:00Z", InputTokens: 9_000_000, CachedInputTokens: 8_000_000, OutputTokens: 90_000, TotalTokens: 9_090_000, Model: "gpt-5.5"},
+	}
+	commands := []store.CommandEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-05-18T10:00:00Z", EventType: "function_call", CommandName: "exec_command"},
+	}
+	if err := db.SaveFileSyncWithDetails(ctx, source, events, commands, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := LoadSummaryWeek(ctx, db, "2026-05-18")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Period != "day" || data.PeriodStart != "2026-05-18" {
+		t.Fatalf("expected day summary for 2026-05-18, got period=%q start=%q", data.Period, data.PeriodStart)
+	}
+	if len(data.Rows) != 2 {
+		t.Fatalf("expected 2 day rows in selected week, got %d", len(data.Rows))
+	}
+	rendered := Render(data, "summary")
+	for _, want := range []string{"Week 2026 May 18th daily credits", "Day", "2026 May 19th", "2026 May 18th"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected weekly drilldown summary to contain %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "Days:") {
+		t.Fatalf("expected summary graph x-axis labels to be omitted:\n%s", rendered)
 	}
 }
 
@@ -232,55 +307,49 @@ func TestRenderSessionsMarksSelectedRow(t *testing.T) {
 	}
 
 	rendered := Render(data, "sessions")
-	if !strings.Contains(rendered, "> session-b") {
-		t.Fatalf("expected selected session marker on second row:\n%s", rendered)
+	if !strings.Contains(rendered, selectedRowMarker+"session-b") {
+		t.Fatalf("expected internal selected session marker on second row:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "> session-b") {
+		t.Fatalf("expected selected row not to render visible > marker:\n%s", rendered)
 	}
 }
 
-func TestLoadReasoningIncludesFunctionCallsByDay(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	err = db.SaveFileSync(ctx, store.SourceFile{
-		Path:              "source.jsonl",
-		SizeBytes:         10,
-		ModTimeUnix:       1,
-		ProcessedOffset:   10,
-		SessionID:         "session-a",
-		FunctionCallCount: 3,
-		LastSeenAt:        "2026-06-20T10:00:00Z",
-	}, []store.TokenEvent{
-		{
-			SessionID:             "session-a",
-			SourcePath:            "source.jsonl",
-			Timestamp:             "2026-06-20T10:00:00Z",
-			InputTokens:           100,
-			OutputTokens:          40,
-			ReasoningOutputTokens: 25,
-			TotalTokens:           140,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestRenderRowsPlacesCreditsImmediatelyBeforeFCalls(t *testing.T) {
+	data := Data{
+		View: "sessions",
+		Rows: []Row{{
+			Label:         "session-a",
+			FunctionCalls: 3,
+			Totals:        withDerived(Totals{TotalTokens: 10, InputTokens: 10, Credits: 42}),
+		}},
 	}
 
-	data, err := Load(ctx, db, "reasoning", 20, time.Now())
-	if err != nil {
-		t.Fatal(err)
+	rendered := Render(data, "sessions")
+	var header string
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.HasPrefix(line, "Group") {
+			header = line
+			break
+		}
 	}
-	if len(data.Rows) != 1 {
-		t.Fatalf("expected 1 reasoning row, got %d", len(data.Rows))
+	if header == "" {
+		t.Fatalf("expected sessions table header:\n%s", rendered)
 	}
-	if data.Rows[0].FunctionCalls != 3 {
-		t.Fatalf("expected 3 function calls, got %d", data.Rows[0].FunctionCalls)
+	headerIndex := strings.Index(header, "Credits")
+	if headerIndex == -1 {
+		t.Fatalf("expected Credits column:\n%s", header)
 	}
-	rendered := Render(data, "reasoning")
-	if !strings.Contains(rendered, "FCalls") {
-		t.Fatalf("expected rendered reasoning table to include FCalls column:\n%s", rendered)
+	fcallsIndex := strings.Index(header, "FCalls")
+	if fcallsIndex == -1 {
+		t.Fatalf("expected FCalls column:\n%s", header)
+	}
+	if headerIndex > fcallsIndex {
+		t.Fatalf("expected Credits to be left of FCalls:\n%s", header)
+	}
+	between := header[headerIndex+len("Credits") : fcallsIndex]
+	if strings.Contains(strings.TrimSpace(between), "Total") {
+		t.Fatalf("expected Credits immediately before FCalls, got intervening header content %q:\n%s", between, header)
 	}
 }
 
@@ -417,8 +486,8 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 	data := Data{
 		View: "summary",
 		Rows: []Row{
-			{Label: "2026-W24", FunctionCalls: 1234, LastSeen: "2026-06-20T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1740918485, InputTokens: 1733772383, CachedInputTokens: 1656928512, OutputTokens: 5163766, ReasoningOutputTokens: 1770977, Credits: 4200.5})},
-			{Label: "2026-W23", FunctionCalls: 12, LastSeen: "2026-06-13T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1200, InputTokens: 1000, CachedInputTokens: 200, OutputTokens: 200, Credits: 0.5})},
+			{Label: "2026 May 18th", FunctionCalls: 1234, LastSeen: "2026-06-20T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1740918485, InputTokens: 1733772383, CachedInputTokens: 1656928512, OutputTokens: 5163766, ReasoningOutputTokens: 1770977, Credits: 4200.5})},
+			{Label: "2026 May 11th", FunctionCalls: 12, LastSeen: "2026-06-13T10:00:00Z", Totals: withDerived(Totals{TotalTokens: 1200, InputTokens: 1000, CachedInputTokens: 200, OutputTokens: 200, Credits: 0.5})},
 		},
 	}
 
@@ -434,19 +503,24 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 		t.Fatal("summary table header not found")
 	}
 
-	expectedHeader := []string{"Week", "Credits", "Total", "Uncached", "Cache Read", "Cache Hit", "FCalls"}
-	expectedRows := [][]string{
-		{"2026-W24", "4.2K", "1.74B", "1.73B", "1.66B", "48.9%", "1.23K"},
-		{"2026-W23", "0.5", "1.2K", "1K", "200", "16.7%", "12"},
-	}
-	columns := columnsFor(append([][]string{expectedHeader}, expectedRows...))
-	assertTableLineAligned(t, lines[headerIndex], columns, expectedHeader)
-	for i, expected := range expectedRows {
-		lineIndex := headerIndex + 1 + i
-		if lineIndex >= len(lines) {
-			t.Fatalf("missing table row %d", i)
+	rendered := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"Week", "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls",
+		"2026 May 18th", "████████░░░░░░░░░░░░ 4.2K/10K", "1.74B", "76.8M", "1.66B", "95.6%", "1.23K",
+		"2026 May 11th", "░░░░░░░░░░░░░░░░░░░░ 0.5/10K", "1.2K",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected rendered summary to contain %q:\n%s", want, rendered)
 		}
-		assertTableLineAligned(t, lines[lineIndex], columns, expected)
+	}
+	if strings.Contains(rendered, "Week             Credits") {
+		t.Fatalf("expected summary table to omit standalone Credits column:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "Weeks:") {
+		t.Fatalf("expected summary graph x-axis labels to be omitted:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "#") {
+		t.Fatalf("expected summary progress bars to use rendered block glyphs, got:\n%s", rendered)
 	}
 }
 
@@ -484,7 +558,7 @@ func TestFormatIntUsesCompactSuffixes(t *testing.T) {
 
 func TestRenderGraphUsesCompactYAxisUnits(t *testing.T) {
 	data := Data{
-		View: "daily",
+		View: "today",
 		Totals: Totals{
 			TotalTokens: 1_500_000_000,
 		},
@@ -494,12 +568,79 @@ func TestRenderGraphUsesCompactYAxisUnits(t *testing.T) {
 		},
 	}
 
-	rendered := Render(data, "daily")
+	rendered := Render(data, "today")
 	if !strings.Contains(rendered, "B") && !strings.Contains(rendered, "M") {
 		t.Fatalf("expected compact graph y-axis labels, got:\n%s", rendered)
 	}
 	if strings.Contains(rendered, "1500000000") {
 		t.Fatalf("expected graph y-axis to avoid raw long numbers, got:\n%s", rendered)
+	}
+}
+
+func TestRenderWithWidthStretchesSummaryGraphAndTable(t *testing.T) {
+	data := Data{
+		View: "summary",
+		Rows: []Row{
+			{Label: "2026 May 18th", Totals: withDerived(Totals{InputTokens: 1000, TotalTokens: 1000, Credits: 20})},
+			{Label: "2026 May 11th", Totals: withDerived(Totals{InputTokens: 500, TotalTokens: 500, Credits: 10})},
+		},
+	}
+
+	rendered := RenderWithWidth(data, "summary", 140)
+	if maxGraphWidth(rendered) < 140 {
+		t.Fatalf("expected summary graph to stretch to at least 140 cells:\n%s", rendered)
+	}
+	if tableHeaderWidth(rendered, "Week") < 140 {
+		t.Fatalf("expected summary table header to stretch to 140 cells:\n%s", rendered)
+	}
+}
+
+func TestRenderWithWidthStretchesSessionTable(t *testing.T) {
+	data := Data{
+		View: "sessions",
+		Rows: []Row{{
+			Label:     "session-a",
+			Directory: "/Users/example/project",
+			Model:     "gpt-5.5",
+			Totals:    withDerived(Totals{InputTokens: 1000, TotalTokens: 1000, Credits: 20}),
+		}},
+	}
+
+	rendered := RenderWithWidth(data, "sessions", 160)
+	if tableHeaderWidth(rendered, "Group") < 160 {
+		t.Fatalf("expected sessions table header to stretch to 160 cells:\n%s", rendered)
+	}
+}
+
+func maxGraphWidth(rendered string) int {
+	maxWidth := 0
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.ContainsAny(line, "┤┼╭╮╯╰─│") {
+			if width := displayWidth(line); width > maxWidth {
+				maxWidth = width
+			}
+		}
+	}
+	return maxWidth
+}
+
+func tableHeaderWidth(rendered, prefix string) int {
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.HasPrefix(line, prefix) && isExpectedTableHeader(line, prefix) {
+			return displayWidth(line)
+		}
+	}
+	return 0
+}
+
+func isExpectedTableHeader(line, prefix string) bool {
+	switch prefix {
+	case "Week":
+		return strings.Contains(line, "Budget")
+	case "Group":
+		return strings.Contains(line, "Credits")
+	default:
+		return true
 	}
 }
 

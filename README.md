@@ -41,7 +41,7 @@ Because the values are cumulative within a session, `agent-stats` should calcula
 hit_rate = cache_read / (cache_read + cache_creation + uncached_input)
 ```
 
-For local Codex logs, `cached_input_tokens` is treated as `cache_read`, `input_tokens` is treated as `uncached_input`, and `cache_creation` is currently `0` because Codex rollouts do not expose a separate cache creation field.
+For local Codex logs, `cached_input_tokens` is treated as `cache_read`, `input_tokens - cached_input_tokens` is treated as `uncached_input` when possible, and `cache_creation` is currently `0` because Codex rollouts do not expose a separate cache creation field.
 
 - Render a fast terminal graph UI for quick inspection.
 - Support a quiet machine-readable mode for scripts.
@@ -68,12 +68,9 @@ The CLI should support a small set of useful views over the same parsed token da
 
 Useful views:
 
-- `summary`: weekly credit spend, cache hit rate, and function-call totals.
-- `today`: current-day totals, grouped by token type and session.
-- `daily`: usage grouped by day, with stacked token types.
+- `summary`: weekly credit spend, cache hit rate, function-call totals, and budget progress.
+- `today`: current-day session totals with a token graph.
 - `sessions`: usage grouped by Codex session, sorted by latest activity, with model and credits.
-- `cache`: cache hit rate grouped by day or session.
-- `reasoning`: reasoning output tokens grouped by day or session.
 - `commands`: function calls grouped by command name, with call count, session count, directory count, and first/last seen timestamps.
 - `payload`: payload events grouped by top-level type, payload type, and phase. When opened for a session, it shows session timing rollups and token usage per interaction.
 - `tokens`: input, cached input, output, and reasoning output grouped together for direct comparison.
@@ -83,12 +80,9 @@ Useful group-by combinations:
 
 | View | Primary group | Secondary group | Useful for |
 | --- | --- | --- | --- |
-| `summary` | `YEAR-W##` | credits/cache/function calls | Understanding weekly spend and cache efficiency |
-| `daily` | day | token type | Spotting heavy usage days |
+| `summary` | Monday week start | budget/cache/function calls | Understanding weekly spend and cache efficiency |
+| `today` | session | token graph | Spotting current-day heavy sessions |
 | `sessions` | session | token type | Finding expensive sessions |
-| `cache --group day` | day | cache hit/miss | Tracking cache efficiency over time |
-| `cache --group session` | session | cache hit/miss | Finding sessions with poor cache reuse |
-| `reasoning --group day` | day | reasoning output | Tracking reasoning-heavy usage |
 | `commands` | command name | function call metadata | Finding the tools and shell commands used most often |
 | `payload` | top-level type/payload type/phase | payload size and timing | Inspecting local Codex event shapes for later analysis |
 | `payload <session-id>` | interaction timestamp | token usage and payload timing | Drilling into one session's interaction-level cost |
@@ -114,10 +108,7 @@ Interactive mode should support colon commands for switching views:
 ```text
 :summary
 :today
-:daily
 :sessions
-:cache
-:reasoning
 :commands
 :payload
 :tokens
@@ -129,13 +120,13 @@ Interactive mode should support colon commands for switching views:
 The same views should also be available as numbered tabs across the top of the UI:
 
 ```text
-1 Summary  2 Today  3 Daily  4 Sessions  5 Hourly  6 Cache  7 Reasoning  8 Commands  9 Payload  10 Tokens  11 Top
+1 Summary  2 Today  3 Sessions  4 Commands  5 Payload  6 Tokens  7 Top
 ```
 
 Keyboard behavior:
 
 - Press `:` to focus the command prompt.
-- Type a view command such as `:daily` and press `Enter` to switch views.
+- Type a view command such as `:today` and press `Enter` to switch views.
 - Press `1` through `9` to switch directly to the first nine tabs.
 - Press `Tab` and `Shift+Tab` to move to the next or previous view, including tabs beyond `9`.
 - In `sessions`, use `j`/`k` to select a session and `Enter` to open its `payload` drilldown.
@@ -374,10 +365,9 @@ CREATE INDEX payload_events_type_idx ON payload_events(top_level_type, payload_t
 
 The `token_events` table should store per-event increments, not cumulative totals. That keeps every view simple:
 
-- `summary`: group token and command totals by `YEAR-W##`, such as `2026-W01`.
-- `daily`: group by `date(timestamp)`.
+- `summary`: group token and command totals by Monday week start, such as `2026 May 18th`.
+- `today`: group the current day's token totals by `session_id` and render the graph in that view.
 - `sessions`: group by `session_id`.
-- `cache`: calculate from summed `cached_input_tokens` and `input_tokens`.
 - `commands`: group `command_events` by `command_name`.
 - `payload`: group `payload_events` by event shape, or by token-count interaction within one session.
 - `credits`: join token rows to `model_credit_rates` by model and apply the per-million-token relationship.
@@ -417,7 +407,7 @@ Implementation notes that changed or clarified the initial plan:
 - Incremental byte-offset parsing stores the last cumulative `total_token_usage` checkpoint per file so appended Codex events can be deduped safely across restarts.
 - The pre-hook uses `go fmt ./...` instead of `gofmt -w .` so it does not traverse local build/module caches or unrelated hidden directories.
 - The first implementation uses polling for active files rather than filesystem notifications. This keeps the dependency surface smaller and is fast enough for the current data volume.
-- The non-interactive `graph` command currently maps to the `daily` graph view. A dedicated `--since` filter still needs to be added.
+- The non-interactive `graph` command currently maps to the `today` graph view. A dedicated `--since` filter still needs to be added.
 
 ## Reference
 

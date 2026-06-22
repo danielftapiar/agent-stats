@@ -225,13 +225,24 @@ func (db *DB) migrate(ctx context.Context) error {
 			reasoning_credits_per_million REAL NOT NULL
 		)`,
 		`INSERT OR IGNORE INTO model_credit_rates (model, input_credits_per_million, cached_input_credits_per_million, output_credits_per_million, reasoning_credits_per_million) VALUES
-			('codex-1', 1.0, 0.25, 4.0, 4.0),
-			('gpt-5.3-codex', 1.0, 0.25, 4.0, 4.0),
-			('gpt-5.3-codex-spark', 1.0, 0.25, 4.0, 4.0),
-			('gpt-5.4-codex', 1.0, 0.25, 4.0, 4.0),
-			('gpt-5.5', 1.0, 0.25, 4.0, 4.0),
-			('gpt-5.5-codex', 1.0, 0.25, 4.0, 4.0),
-			('unknown', 1.0, 0.25, 4.0, 4.0)`,
+			('codex-1', 46.0, 46.0, 46.0, 46.0),
+			('gpt-5.3-codex', 46.0, 46.0, 46.0, 46.0),
+			('gpt-5.3-codex-spark', 46.0, 46.0, 46.0, 46.0),
+			('gpt-5.4', 46.0, 46.0, 46.0, 46.0),
+			('gpt-5.4-codex', 46.0, 46.0, 46.0, 46.0),
+			('gpt-5.5', 46.0, 46.0, 46.0, 46.0),
+			('gpt-5.5-codex', 46.0, 46.0, 46.0, 46.0),
+			('unknown', 46.0, 46.0, 46.0, 46.0)`,
+		`UPDATE model_credit_rates
+			SET input_credits_per_million = 46.0,
+				cached_input_credits_per_million = 46.0,
+				output_credits_per_million = 46.0,
+				reasoning_credits_per_million = 46.0
+			WHERE model IN ('codex-1', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.4', 'gpt-5.4-codex', 'gpt-5.5', 'gpt-5.5-codex', 'unknown')
+				AND input_credits_per_million = 1.0
+				AND cached_input_credits_per_million = 0.25
+				AND output_credits_per_million = 4.0
+				AND reasoning_credits_per_million = 4.0`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.sql.ExecContext(ctx, stmt); err != nil {
