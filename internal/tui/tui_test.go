@@ -236,6 +236,49 @@ func TestSelectedRowCanScrollHorizontallyInSmallWindow(t *testing.T) {
 	}
 }
 
+func TestPayloadEnterUsesSelectedPayloadID(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SaveFileSyncWithDetails(ctx, store.SourceFile{
+		Path:            "source.jsonl",
+		SizeBytes:       10,
+		ModTimeUnix:     1,
+		ProcessedOffset: 10,
+		SessionID:       "session-a",
+	}, nil, nil, []store.PayloadEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", TopLevelType: "response_item", PayloadType: "function_call", CallID: "call-1", PayloadJSON: `{"type":"function_call"}`},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:01Z", TopLevelType: "response_item", PayloadType: "message", Role: "assistant", PayloadJSON: `{"type":"message","content":[{"type":"output_text","text":"hello"}]}`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := newTestModel(views.Data{
+		View:    "payload",
+		Session: "session-a",
+		Rows: []views.Row{
+			{ID: 1, Label: "function_call"},
+			{ID: 2, Label: "llm_response"},
+		},
+	})
+	m.ctx = ctx
+	m.db = db
+	m.active = viewIndex("payload")
+	m.session = "session-a"
+	m.payloadRow = 1
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if m.interaction != "2" {
+		t.Fatalf("expected enter to load selected payload ID 2, got %q", m.interaction)
+	}
+	if !strings.Contains(m.data.Detail, "hello") {
+		t.Fatalf("expected selected payload detail to load, got %q", m.data.Detail)
+	}
+}
+
 func TestDeleteSessionRequiresTypingYes(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))

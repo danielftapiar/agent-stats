@@ -159,6 +159,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if strings.HasPrefix(m.session, "> ") {
 					m.session = strings.TrimPrefix(m.session, "> ")
 				}
+				m.interaction = ""
+				m.payloadRow = 0
 				if idx := viewIndex("payload"); idx >= 0 {
 					m.active = idx
 				}
