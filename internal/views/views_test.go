@@ -3,6 +3,7 @@ package views
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -410,7 +411,7 @@ func TestLoadCommandsGroupsByCommandName(t *testing.T) {
 	}
 }
 
-func TestLoadPayloadSummariesAndSessionInteractions(t *testing.T) {
+func TestLoadPayloadSummariesAndSessionResponses(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
 	if err != nil {
@@ -428,8 +429,9 @@ func TestLoadPayloadSummariesAndSessionInteractions(t *testing.T) {
 	}
 	payloads := []store.PayloadEvent{
 		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:00:00Z", TopLevelType: "event_msg", PayloadType: "agent_message", Phase: "commentary", PayloadBytes: 100},
-		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:00Z", TopLevelType: "response_item", PayloadType: "function_call", CommandName: "exec_command", NormalizedCommand: "sed", PayloadBytes: 200},
-		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:30Z", TopLevelType: "response_item", PayloadType: "message", Role: "assistant", PayloadBytes: 150, InputTextCount: 1, InputTextBytes: 44},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:00Z", TopLevelType: "response_item", PayloadType: "function_call", CommandName: "exec_command", NormalizedCommand: "sed", CallID: "call-1", Arguments: `{"cmd":"rtk sed -n '1,20p' README.md"}`, ArgumentsBytes: 41, PayloadBytes: 2048, DurationMS: 20, PayloadJSON: `{"type":"function_call","call_id":"call-1","name":"exec_command","arguments":"{\"cmd\":\"rtk sed -n '1,20p' README.md\"}"}`},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:20Z", TopLevelType: "response_item", PayloadType: "function_call_output", CallID: "call-1", ResponseOutputBytes: 4096, PayloadBytes: 4096, DurationMS: 30, PayloadJSON: `{"type":"function_call_output","call_id":"call-1","output":"line one\nline two"}`},
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:01:30Z", TopLevelType: "response_item", PayloadType: "message", Role: "assistant", PayloadBytes: 3072, InputTextCount: 1, InputTextBytes: 44, ResponseOutputBytes: 2048, PayloadJSON: `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello ` + "`code`" + `\nworld"}]}`},
 		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T10:02:00Z", TopLevelType: "event_msg", PayloadType: "token_count", PayloadBytes: 300, InputTokens: 10, CachedInputTokens: 5, OutputTokens: 4, ReasoningOutputTokens: 1, TotalTokens: 14},
 	}
 	if err := db.SaveFileSyncWithDetails(ctx, source, nil, nil, payloads); err != nil {
@@ -440,8 +442,8 @@ func TestLoadPayloadSummariesAndSessionInteractions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(global.Rows) != 4 {
-		t.Fatalf("expected 4 payload groups, got %d", len(global.Rows))
+	if len(global.Rows) != 5 {
+		t.Fatalf("expected 5 payload groups, got %d", len(global.Rows))
 	}
 	if global.Rows[0].Count < global.Rows[len(global.Rows)-1].Count {
 		t.Fatalf("expected payload groups ordered by count desc: %#v", global.Rows)
@@ -458,28 +460,67 @@ func TestLoadPayloadSummariesAndSessionInteractions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(session.Rows) != 1 {
-		t.Fatalf("expected 1 interaction row, got %d", len(session.Rows))
+	if len(session.Rows) != 3 {
+		t.Fatalf("expected 3 response rows, got %d", len(session.Rows))
 	}
-	if session.Rows[0].Totals.TotalTokens != 14 {
-		t.Fatalf("expected interaction total tokens 14, got %d", session.Rows[0].Totals.TotalTokens)
+	if session.Rows[0].ResponseOutputBytes != 2048 {
+		t.Fatalf("expected latest message response output bytes 2048, got %d", session.Rows[0].ResponseOutputBytes)
 	}
 	renderedSession := Render(session, "payload")
-	for _, want := range []string{"Session: session-a", "top command", "input_text", "role count", "Interaction", "Payload Bytes"} {
+	for _, want := range []string{"Session: session-a", "session_duration", "Avg Duration", "command", "input_text", "role count", "Function calls", "Type", "Arguments", "Output Bytes", "llm_response", "function_call", "sed", "2kb", "4kb"} {
 		if !strings.Contains(renderedSession, want) {
 			t.Fatalf("expected session payload drilldown to contain %q:\n%s", want, renderedSession)
 		}
 	}
-	interaction, err := LoadPayloadInteraction(ctx, db, "session-a", "2026-06-20T10:02:00Z")
+	if strings.Contains(renderedSession, "Interaction") {
+		t.Fatalf("expected session payload drilldown to omit interaction list:\n%s", renderedSession)
+	}
+	if strings.Contains(renderedSession, "prompt to final answer") {
+		t.Fatalf("expected session payload metadata to omit prompt-final metric:\n%s", renderedSession)
+	}
+	topMetadata := strings.Split(renderedSession, "Function calls")[0]
+	if strings.Contains(topMetadata, "Max Dur") || strings.Contains(topMetadata, "Avg TTFT") {
+		t.Fatalf("expected right-side session metadata to omit timing columns:\n%s", renderedSession)
+	}
+	if !strings.Contains(renderedSession, "Function calls") || !strings.Contains(renderedSession, "Avg Dur") {
+		t.Fatalf("expected function calls section to keep timing columns:\n%s", renderedSession)
+	}
+
+	functionCall := findPayloadRow(t, session.Rows, "function_call")
+	functionCallDetail, err := LoadPayloadInteraction(ctx, db, "session-a", strconv.FormatInt(functionCall.ID, 10))
 	if err != nil {
 		t.Fatal(err)
 	}
-	renderedInteraction := Render(interaction, "payload")
-	for _, want := range []string{"Interaction: 2026-06-20T10:02", "interaction payload", "event_msg count", "input_text", "top command", "role count"} {
-		if !strings.Contains(renderedInteraction, want) {
-			t.Fatalf("expected interaction drilldown to contain %q:\n%s", want, renderedInteraction)
+	renderedFunctionCall := Render(functionCallDetail, "payload")
+	if !strings.Contains(renderedFunctionCall, "line one\nline two") || strings.Contains(renderedFunctionCall, `\n`) {
+		t.Fatalf("expected function_call expansion to render matching output newlines:\n%s", renderedFunctionCall)
+	}
+
+	llmResponse := findPayloadRow(t, session.Rows, "llm_response")
+	llmDetail, err := LoadPayloadInteraction(ctx, db, "session-a", strconv.FormatInt(llmResponse.ID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderedLLM := Render(llmDetail, "payload")
+	for _, want := range []string{"Object", "Value", "type", "message", "metadata", "response_item", "role", "assistant", "Payload"} {
+		if !strings.Contains(renderedLLM, want) {
+			t.Fatalf("expected llm_response expansion to contain metadata %q:\n%s", want, renderedLLM)
 		}
 	}
+	if !strings.Contains(renderedLLM, "hello `code`\nworld") || strings.Contains(renderedLLM, `\n`) {
+		t.Fatalf("expected llm_response expansion to render payload newlines:\n%s", renderedLLM)
+	}
+}
+
+func findPayloadRow(t *testing.T, rows []Row, label string) Row {
+	t.Helper()
+	for _, row := range rows {
+		if row.Label == label {
+			return row
+		}
+	}
+	t.Fatalf("expected payload row %q in %#v", label, rows)
+	return Row{}
 }
 
 func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {

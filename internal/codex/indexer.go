@@ -20,7 +20,7 @@ type Indexer struct {
 	sessionsDir string
 }
 
-const payloadMetricsVersion = 1
+const payloadMetricsVersion = 2
 
 func NewIndexer(db *store.DB, sessionsDir string) *Indexer {
 	return &Indexer{db: db, sessionsDir: sessionsDir}
@@ -282,26 +282,29 @@ func ParseFile(r io.Reader, sourcePath, sessionID string, startOffset int64, ini
 			result.Model = payload.Model
 		}
 		payloadEvent := store.PayloadEvent{
-			SessionID:          sessionID,
-			SourcePath:         sourcePath,
-			Timestamp:          raw.Timestamp,
-			TopLevelType:       raw.Type,
-			PayloadType:        payload.Type,
-			Phase:              payload.Phase,
-			PayloadBytes:       payloadByteSize(raw.Payload, payload),
-			ContentBytes:       payloadContentBytes(payload),
-			Role:               payload.Role,
-			InputTextCount:     payloadInputTextCount(payload),
-			InputTextBytes:     payloadInputTextBytes(payload),
-			CompletedAt:        payload.CompletedAt,
-			DurationMS:         rawInt64(payload.DurationMS),
-			TimeToFirstTokenMS: rawInt64(payload.TimeToFirstTokenMS),
-			CommandName:        commandName(payload.Name),
-			NormalizedCommand:  normalizedPayloadCommand(payload),
-			CallID:             payload.CallID,
-			Model:              currentModel,
-			PayloadJSON:        string(raw.Payload),
-			RawJSON:            string(line),
+			SessionID:           sessionID,
+			SourcePath:          sourcePath,
+			Timestamp:           raw.Timestamp,
+			TopLevelType:        raw.Type,
+			PayloadType:         payload.Type,
+			Phase:               payload.Phase,
+			PayloadBytes:        payloadByteSize(raw.Payload, payload),
+			ContentBytes:        payloadContentBytes(payload),
+			Role:                payload.Role,
+			InputTextCount:      payloadInputTextCount(payload),
+			InputTextBytes:      payloadInputTextBytes(payload),
+			CompletedAt:         payload.CompletedAt,
+			DurationMS:          rawInt64(payload.DurationMS),
+			TimeToFirstTokenMS:  rawInt64(payload.TimeToFirstTokenMS),
+			CommandName:         commandName(payload.Name),
+			NormalizedCommand:   normalizedPayloadCommand(payload),
+			CallID:              payload.CallID,
+			Arguments:           payload.Arguments,
+			ArgumentsBytes:      int64(len(payload.Arguments)),
+			ResponseOutputBytes: payloadResponseOutputBytes(raw.Type, payload),
+			Model:               currentModel,
+			PayloadJSON:         string(raw.Payload),
+			RawJSON:             string(line),
 		}
 		if payloadEvent.PayloadType == "" {
 			payloadEvent.PayloadType = "(none)"
@@ -437,6 +440,22 @@ func payloadInputTextBytes(payload rawPayload) int64 {
 	var total int64
 	for _, content := range payload.Content {
 		if content.Type == "input_text" {
+			total += int64(len(content.Text))
+		}
+	}
+	return total
+}
+
+func payloadResponseOutputBytes(topLevelType string, payload rawPayload) int64 {
+	if topLevelType != "response_item" {
+		return 0
+	}
+	var total int64
+	if payload.Output != "" {
+		total += int64(len(payload.Output))
+	}
+	for _, content := range payload.Content {
+		if content.Type != "input_text" && content.Text != "" {
 			total += int64(len(content.Text))
 		}
 	}

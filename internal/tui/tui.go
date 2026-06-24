@@ -159,6 +159,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if strings.HasPrefix(m.session, "> ") {
 					m.session = strings.TrimPrefix(m.session, "> ")
 				}
+				m.interaction = ""
+				m.payloadRow = 0
 				if idx := viewIndex("payload"); idx >= 0 {
 					m.active = idx
 				}
@@ -167,7 +169,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.inSessionPayload() && len(m.data.Rows) > 0 {
 				m.clampPayloadRow()
-				m.interaction = m.data.Rows[m.payloadRow].Label
+				m.interaction = fmt.Sprintf("%d", m.data.Rows[m.payloadRow].ID)
 				m.reload()
 				return m, nil
 			}
@@ -542,7 +544,7 @@ func (m model) themeContent(content string) string {
 		case strings.ContainsAny(line, "┤┼╭╮╯╰─│"):
 			lines[i] = m.theme.Graph.Render(line)
 		default:
-			lines[i] = m.themeProgressBars(line)
+			lines[i] = m.themeMarkdown(m.themeProgressBars(line))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -640,7 +642,7 @@ func (m *model) deleteSession(sessionID string) {
 }
 
 func isTableHeader(line string) bool {
-	for _, prefix := range []string{"Group", "Week", "Day", "Command", "Payload", "Metric", "Interaction"} {
+	for _, prefix := range []string{"Group", "Week", "Day", "Command", "Payload", "Metric", "Interaction", "Type", "Object"} {
 		if strings.HasPrefix(line, prefix) {
 			return true
 		}
@@ -672,9 +674,20 @@ func (m model) themeProgressBars(line string) string {
 	})
 }
 
+func (m model) themeMarkdown(line string) string {
+	return inlineCodePattern.ReplaceAllStringFunc(line, func(match string) string {
+		if len(match) < 2 {
+			return match
+		}
+		content := strings.Trim(match, "`")
+		return m.theme.TableHeader.Render(content)
+	})
+}
+
 const selectedRowMarker = "\x1f"
 
 var progressGlyphPattern = regexp.MustCompile(`[█░]+`)
+var inlineCodePattern = regexp.MustCompile("`[^`]+`")
 
 func (m model) renderThemePicker() string {
 	var b strings.Builder

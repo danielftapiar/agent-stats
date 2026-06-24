@@ -140,10 +140,13 @@ func TestParseFileExtractsSessionDirectoryAndFunctionCalls(t *testing.T) {
 		t.Fatalf("expected model gpt-5.5, got %q", result.Model)
 	}
 	if len(result.Payloads) != 5 {
-		t.Fatalf("expected 4 payload rows, got %d", len(result.Payloads))
+		t.Fatalf("expected 5 payload rows, got %d", len(result.Payloads))
 	}
 	if result.Payloads[2].NormalizedCommand != "sed" {
 		t.Fatalf("expected rtk sed to normalize to sed, got %q", result.Payloads[2].NormalizedCommand)
+	}
+	if result.Payloads[2].Arguments == "" || result.Payloads[2].ArgumentsBytes != int64(len(result.Payloads[2].Arguments)) {
+		t.Fatalf("expected function_call arguments metrics, got %+v", result.Payloads[2])
 	}
 	if result.Payloads[4].PayloadType != "token_count" || result.Payloads[4].TotalTokens != 12 || result.Payloads[4].Model != "gpt-5.5" {
 		t.Fatalf("expected token_count payload metadata, got %+v", result.Payloads[4])
@@ -171,6 +174,9 @@ func TestParseFileCalculatesPayloadContentMetrics(t *testing.T) {
 	if result.Payloads[0].ContentBytes != int64(len("hello world")) {
 		t.Fatalf("expected output bytes, got %+v", result.Payloads[0])
 	}
+	if result.Payloads[0].ResponseOutputBytes != int64(len("hello world")) {
+		t.Fatalf("expected response output bytes, got %+v", result.Payloads[0])
+	}
 	if result.Payloads[0].PayloadBytes <= result.Payloads[0].ContentBytes {
 		t.Fatalf("expected payload bytes to include raw json plus content bytes, got %+v", result.Payloads[0])
 	}
@@ -179,5 +185,8 @@ func TestParseFileCalculatesPayloadContentMetrics(t *testing.T) {
 	}
 	if result.Payloads[1].InputTextCount != 1 || result.Payloads[1].InputTextBytes != int64(len("show sessions")) {
 		t.Fatalf("expected input_text metrics, got %+v", result.Payloads[1])
+	}
+	if result.Payloads[1].ResponseOutputBytes != int64(len("done")) {
+		t.Fatalf("expected response output bytes to exclude input_text, got %+v", result.Payloads[1])
 	}
 }
