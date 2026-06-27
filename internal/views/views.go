@@ -640,13 +640,80 @@ func formatPayloadDetail(payloadJSON, rawJSON string) string {
 	}
 	var value any
 	if err := json.Unmarshal([]byte(content), &value); err == nil {
+		if text := renderedPayloadText(value); text != "" {
+			return normalizeEscapedText(text)
+		}
 		if rendered, err := json.MarshalIndent(value, "", "  "); err == nil {
 			content = string(rendered)
 		}
 	}
+	return normalizeEscapedText(content)
+}
+
+func normalizeEscapedText(content string) string {
 	content = strings.ReplaceAll(content, `\n`, "\n")
 	content = strings.ReplaceAll(content, `\t`, "\t")
 	return content
+}
+
+func renderedPayloadText(value any) string {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if payload, ok := object["payload"]; ok {
+		if text := renderedPayloadText(payload); text != "" {
+			return text
+		}
+	}
+	if text := contentText(object["content"]); text != "" {
+		return text
+	}
+	for _, key := range []string{"output", "text", "arguments"} {
+		text, ok := object[key].(string)
+		if !ok || text == "" {
+			continue
+		}
+		if key == "arguments" {
+			return formatArgumentText(text)
+		}
+		return text
+	}
+	return ""
+}
+
+func contentText(value any) string {
+	switch content := value.(type) {
+	case string:
+		return content
+	case []any:
+		parts := make([]string, 0, len(content))
+		for _, item := range content {
+			object, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			text, ok := object["text"].(string)
+			if ok && text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n\n")
+	default:
+		return ""
+	}
+}
+
+func formatArgumentText(value string) string {
+	var decoded any
+	if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+		return value
+	}
+	rendered, err := json.MarshalIndent(decoded, "", "  ")
+	if err != nil {
+		return value
+	}
+	return string(rendered)
 }
 
 func singlePayloadMetricArgs(ctx context.Context, db *store.DB, label, query string, args ...any) (Row, error) {
@@ -1076,13 +1143,29 @@ func writePayloadDetailFields(b *strings.Builder, fields []Row, width int) {
 	if len(fields) == 0 {
 		return
 	}
-	tableRows := [][]string{{"Object", "Value"}}
-	for _, field := range fields {
-		tableRows = append(tableRows, []string{field.Label, field.Phase})
+	if width <= 0 {
+		width = 96
 	}
-	columns := columnsForWidth(tableRows, width)
-	for _, row := range tableRows {
-		writeTableLine(b, columns, row)
+	columnCount := 3
+	gap := 2
+	columnWidth := (width - (gap * (columnCount - 1))) / columnCount
+	if columnWidth < 20 {
+		columnWidth = 20
+	}
+	for index := 0; index < len(fields); index += columnCount {
+		for column := 0; column < columnCount; column++ {
+			fieldIndex := index + column
+			cell := ""
+			if fieldIndex < len(fields) {
+				field := fields[fieldIndex]
+				cell = truncate(field.Label+": "+field.Phase, columnWidth)
+			}
+			b.WriteString(padRight(cell, columnWidth))
+			if column < columnCount-1 {
+				b.WriteString(strings.Repeat(" ", gap))
+			}
+		}
+		b.WriteString("\n")
 	}
 }
 

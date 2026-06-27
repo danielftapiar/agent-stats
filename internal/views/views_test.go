@@ -502,9 +502,14 @@ func TestLoadPayloadSummariesAndSessionResponses(t *testing.T) {
 		t.Fatal(err)
 	}
 	renderedLLM := Render(llmDetail, "payload")
-	for _, want := range []string{"Object", "Value", "type", "message", "metadata", "response_item", "role", "assistant", "Payload"} {
+	for _, want := range []string{"type: message", "metadata: response_item", "role: assistant", "Payload"} {
 		if !strings.Contains(renderedLLM, want) {
 			t.Fatalf("expected llm_response expansion to contain metadata %q:\n%s", want, renderedLLM)
+		}
+	}
+	for _, unwanted := range []string{"Object", "Value", `"content"`, `"output_text"`} {
+		if strings.Contains(renderedLLM, unwanted) {
+			t.Fatalf("expected llm_response expansion to render compact metadata and content text, got %q:\n%s", unwanted, renderedLLM)
 		}
 	}
 	if !strings.Contains(renderedLLM, "hello `code`\nworld") || strings.Contains(renderedLLM, `\n`) {
