@@ -207,6 +207,84 @@ func TestSummaryVimSelectionDrillsIntoSelectedWeek(t *testing.T) {
 	}
 }
 
+func TestSummaryUpAtFirstRowScrollsBackToGraph(t *testing.T) {
+	m := newTestModel(manyRowsData(12))
+	m.active = viewIndex("summary")
+	m.summaryRow = 0
+	m.viewport = viewport.New(80, 6)
+	m.setViewportContent()
+	before := m.viewport.YOffset
+	if before == 0 {
+		t.Fatal("expected selected first summary row to be below the graph in a small viewport")
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(model)
+
+	if m.summaryRow != 0 {
+		t.Fatalf("expected first summary row to remain selected, got %d", m.summaryRow)
+	}
+	if m.viewport.YOffset >= before {
+		t.Fatalf("expected up at first summary row to scroll toward graph, before=%d after=%d", before, m.viewport.YOffset)
+	}
+}
+
+func TestTodayBlockSelectionDrillsIntoFilteredSessions(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SaveFileSyncWithDetails(ctx, store.SourceFile{
+		Path:            "source.jsonl",
+		SizeBytes:       10,
+		ModTimeUnix:     1,
+		ProcessedOffset: 10,
+		SessionID:       "session-a",
+		Model:           "gpt-5.5",
+	}, []store.TokenEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T09:00:00Z", InputTokens: 10, TotalTokens: 10, Model: "gpt-5.5"},
+		{SessionID: "session-b", SourcePath: "source.jsonl", Timestamp: "2026-06-20T14:00:00Z", InputTokens: 20, TotalTokens: 20, Model: "gpt-5.5"},
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestModel(views.Data{
+		View: "today",
+		GraphRows: []views.Row{
+			{Label: "00:00-08:00", FirstSeen: "2026-06-20T00:00:00Z", LastSeen: "2026-06-20T08:00:00Z"},
+			{Label: "08:00-18:00", FirstSeen: "2026-06-20T08:00:00Z", LastSeen: "2026-06-20T18:00:00Z"},
+			{Label: "18:00-00:00", FirstSeen: "2026-06-20T18:00:00Z", LastSeen: "2026-06-21T00:00:00Z"},
+		},
+	})
+	m.ctx = ctx
+	m.db = db
+	m.active = viewIndex("today")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(model)
+	if m.todayBlock != 1 {
+		t.Fatalf("expected selected today block 1, got %d", m.todayBlock)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+
+	if viewNames[m.active] != "sessions" {
+		t.Fatalf("expected enter to switch to sessions, got %q", viewNames[m.active])
+	}
+	if m.sessionsLabel != "08:00-18:00" {
+		t.Fatalf("expected selected time block label, got %q", m.sessionsLabel)
+	}
+	if m.data.Period != "time_block" || m.data.PeriodStart != "08:00-18:00" {
+		t.Fatalf("expected time-block filtered sessions data, got period=%q start=%q", m.data.Period, m.data.PeriodStart)
+	}
+	if len(m.data.Rows) != 2 {
+		t.Fatalf("expected both sessions in 08:00-18:00 block, got %#v", m.data.Rows)
+	}
+}
+
 func TestSelectedRowCanScrollHorizontallyInSmallWindow(t *testing.T) {
 	m := newTestModel(views.Data{
 		View:          "sessions",

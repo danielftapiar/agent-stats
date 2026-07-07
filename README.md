@@ -69,7 +69,7 @@ The CLI should support a small set of useful views over the same parsed token da
 Useful views:
 
 - `summary`: weekly credit spend, cache hit rate, function-call totals, and budget progress.
-- `today`: current-day session totals with a token graph.
+- `today`: current-day session totals with a custom time-block token graph and time-block drilldown.
 - `sessions`: usage grouped by Codex session, sorted by latest activity, with model and credits.
 - `commands`: function calls grouped by command name, with call count, session count, directory count, and first/last seen timestamps.
 - `payload`: payload events grouped by top-level type, payload type, and phase. When opened for a session, it shows session timing rollups and token usage per interaction.
@@ -142,12 +142,12 @@ The default experience should be snappy and terminal-native:
 - Keep aggregation simple and incremental.
 - Prefer compact charts over verbose tables.
 - Make the graph UI responsive on small terminal widths.
+- Render token usage as labelled terminal bar graphs.
 
 The terminal UI is built with:
 
 - `github.com/charmbracelet/bubbletea` for the interactive TUI loop.
 - `github.com/charmbracelet/lipgloss` for styling.
-- `github.com/guptarohit/asciigraph` for fast line graphs.
 
 ## Build
 
@@ -166,6 +166,14 @@ Run it locally:
 ```bash
 ./bin/agent-stats summary
 ```
+
+Configure the weekly credit budget shown in summary progress bars:
+
+```bash
+AGENT_STATS_WEEKLY_CREDIT_BUDGET=5000 ./bin/agent-stats summary
+```
+
+If unset or invalid, the budget defaults to `10000` credits per week.
 
 Install it into your `GOBIN`:
 
@@ -366,7 +374,7 @@ CREATE INDEX payload_events_type_idx ON payload_events(top_level_type, payload_t
 The `token_events` table should store per-event increments, not cumulative totals. That keeps every view simple:
 
 - `summary`: group token and command totals by Monday week start, such as `2026 May 18th`.
-- `today`: group the current day's token totals by `session_id` and render the graph in that view.
+- `today`: group the current day's token totals by `session_id`, render `00:00-08:00`, `08:00-18:00`, and `18:00-00:00` graph buckets, and allow drilling into a time-block-filtered sessions view.
 - `sessions`: group by `session_id`.
 - `commands`: group `command_events` by `command_name`.
 - `payload`: group `payload_events` by event shape, or by token-count interaction within one session.

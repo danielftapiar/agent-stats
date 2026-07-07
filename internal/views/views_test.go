@@ -70,14 +70,20 @@ func TestLoadTodayAggregatesTokenEvents(t *testing.T) {
 	if data.Rows[0].Totals.CacheReadInputTokens != 60 {
 		t.Fatalf("expected cache read tokens 60, got %d", data.Rows[0].Totals.CacheReadInputTokens)
 	}
-	if len(data.GraphRows) != 24 {
-		t.Fatalf("expected 24 hourly graph rows, got %d", len(data.GraphRows))
+	if len(data.GraphRows) != 3 {
+		t.Fatalf("expected 3 custom time-block graph rows, got %d", len(data.GraphRows))
 	}
-	if data.GraphRows[0].Label != "00:00" || data.GraphRows[23].Label != "23:59" {
-		t.Fatalf("expected graph to span 00:00 through 23:00, got first=%q last=%q", data.GraphRows[0].Label, data.GraphRows[23].Label)
+	if data.GraphRows[0].Label != "00:00-08:00" || data.GraphRows[2].Label != "18:00-00:00" {
+		t.Fatalf("expected graph to span 00:00-08:00 through 18:00-00:00, got first=%q last=%q", data.GraphRows[0].Label, data.GraphRows[2].Label)
 	}
-	if data.GraphRows[10].Totals.TotalTokens != 15 || data.GraphRows[11].Totals.TotalTokens != 30 {
-		t.Fatalf("expected hourly token totals at 10:00 and 11:00, got %d and %d", data.GraphRows[10].Totals.TotalTokens, data.GraphRows[11].Totals.TotalTokens)
+	if data.GraphRows[1].Totals.TotalTokens != 45 {
+		t.Fatalf("expected time-block token total at 08:00-18:00, got %d", data.GraphRows[1].Totals.TotalTokens)
+	}
+	rendered := Render(data, "today")
+	for _, want := range []string{"Time", "| Tokens", "00:00-08:00 |", "08:00-18:00 |", "18:00-00:00 |"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected today graph to contain custom time-block bar label %q:\n%s", want, rendered)
+		}
 	}
 }
 
@@ -184,6 +190,84 @@ func TestLoadSummaryGroupsWeeklyCreditsAndFunctionCalls(t *testing.T) {
 	}
 }
 
+func TestRenderSummaryUsesWeeklyCreditBudgetFromEnv(t *testing.T) {
+	t.Setenv(weeklyCreditBudgetEnv, "5000")
+
+	rendered := Render(summaryBudgetData(2_500), "summary")
+
+	if !strings.Contains(rendered, "2.5K/5K") {
+		t.Fatalf("expected summary budget to use env override:\n%s", rendered)
+	}
+}
+
+func TestRenderSummaryUsesDefaultWeeklyCreditBudgetForInvalidEnv(t *testing.T) {
+	for _, value := range []string{"", "not-a-number", "0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(weeklyCreditBudgetEnv, value)
+
+			rendered := Render(summaryBudgetData(2_500), "summary")
+
+			if !strings.Contains(rendered, "2.5K/10K") {
+				t.Fatalf("expected summary budget to use default for env %q:\n%s", value, rendered)
+			}
+		})
+	}
+}
+
+func TestLoadSessionsForTimeRangeFiltersRows(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	source := store.SourceFile{
+		Path:            "source.jsonl",
+		SizeBytes:       10,
+		ModTimeUnix:     1,
+		ProcessedOffset: 10,
+		SessionID:       "session-a",
+		Model:           "gpt-5.5",
+	}
+	events := []store.TokenEvent{
+		{SessionID: "session-a", SourcePath: "source.jsonl", Timestamp: "2026-06-20T09:00:00Z", InputTokens: 10, TotalTokens: 10, Model: "gpt-5.5"},
+		{SessionID: "session-b", SourcePath: "source.jsonl", Timestamp: "2026-06-20T14:00:00Z", InputTokens: 20, TotalTokens: 20, Model: "gpt-5.5"},
+	}
+	if err := db.SaveFileSyncWithDetails(ctx, source, events, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := LoadSessionsForTimeRange(ctx, db, "2026-06-20T08:00:00Z", "2026-06-20T18:00:00Z", "08:00-18:00", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Period != "time_block" || data.PeriodStart != "08:00-18:00" {
+		t.Fatalf("expected time block period metadata, got period=%q start=%q", data.Period, data.PeriodStart)
+	}
+	if len(data.Rows) != 2 {
+		t.Fatalf("expected both sessions in 08:00-18:00 block, got %#v", data.Rows)
+	}
+	rendered := Render(data, "sessions")
+	if !strings.Contains(rendered, "Time block: 08:00-18:00") {
+		t.Fatalf("expected rendered sessions to show time block label:\n%s", rendered)
+	}
+}
+
+func summaryBudgetData(credits float64) Data {
+	return Data{
+		View: "summary",
+		Rows: []Row{{
+			Label: "2026 May 18th",
+			Totals: withDerived(Totals{
+				InputTokens: 1,
+				TotalTokens: 1,
+				Credits:     credits,
+			}),
+		}},
+	}
+}
+
 func TestLoadSummaryWeekGroupsDaysWithGraph(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
@@ -228,8 +312,8 @@ func TestLoadSummaryWeekGroupsDaysWithGraph(t *testing.T) {
 			t.Fatalf("expected weekly drilldown summary to contain %q:\n%s", want, rendered)
 		}
 	}
-	if strings.Contains(rendered, "Days:") {
-		t.Fatalf("expected summary graph x-axis labels to be omitted:\n%s", rendered)
+	if !strings.Contains(rendered, "Day") || !strings.Contains(rendered, "| Tokens") {
+		t.Fatalf("expected weekly drilldown summary graph to include day bar labels:\n%s", rendered)
 	}
 }
 
@@ -506,6 +590,7 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 	rendered := strings.Join(lines, "\n")
 	for _, want := range []string{
 		"Week", "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls",
+		"Week", "| Tokens", "2026 May 11th |", "2026 May 18th |",
 		"2026 May 18th", "████████░░░░░░░░░░░░ 4.2K/10K", "1.74B", "76.8M", "1.66B", "95.6%", "1.23K",
 		"2026 May 11th", "░░░░░░░░░░░░░░░░░░░░ 0.5/10K", "1.2K",
 	} {
@@ -515,9 +600,6 @@ func TestRenderSummaryAlignsValuesToColumns(t *testing.T) {
 	}
 	if strings.Contains(rendered, "Week             Credits") {
 		t.Fatalf("expected summary table to omit standalone Credits column:\n%s", rendered)
-	}
-	if strings.Contains(rendered, "Weeks:") {
-		t.Fatalf("expected summary graph x-axis labels to be omitted:\n%s", rendered)
 	}
 	if strings.Contains(rendered, "#") {
 		t.Fatalf("expected summary progress bars to use rendered block glyphs, got:\n%s", rendered)
@@ -556,7 +638,7 @@ func TestFormatIntUsesCompactSuffixes(t *testing.T) {
 	}
 }
 
-func TestRenderGraphUsesCompactYAxisUnits(t *testing.T) {
+func TestRenderGraphUsesCompactTokenUnits(t *testing.T) {
 	data := Data{
 		View: "today",
 		Totals: Totals{
@@ -570,10 +652,10 @@ func TestRenderGraphUsesCompactYAxisUnits(t *testing.T) {
 
 	rendered := Render(data, "today")
 	if !strings.Contains(rendered, "B") && !strings.Contains(rendered, "M") {
-		t.Fatalf("expected compact graph y-axis labels, got:\n%s", rendered)
+		t.Fatalf("expected compact graph token labels, got:\n%s", rendered)
 	}
 	if strings.Contains(rendered, "1500000000") {
-		t.Fatalf("expected graph y-axis to avoid raw long numbers, got:\n%s", rendered)
+		t.Fatalf("expected graph labels to avoid raw long numbers, got:\n%s", rendered)
 	}
 }
 
@@ -615,7 +697,7 @@ func TestRenderWithWidthStretchesSessionTable(t *testing.T) {
 func maxGraphWidth(rendered string) int {
 	maxWidth := 0
 	for _, line := range strings.Split(rendered, "\n") {
-		if strings.ContainsAny(line, "┤┼╭╮╯╰─│") {
+		if strings.Contains(line, "|") && strings.ContainsAny(line, "█░") {
 			if width := displayWidth(line); width > maxWidth {
 				maxWidth = width
 			}
