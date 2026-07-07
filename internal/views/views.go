@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/danieltapia/agent-stats/internal/store"
-	"github.com/guptarohit/asciigraph"
 	"github.com/muesli/termenv"
 )
 
@@ -87,7 +88,7 @@ func Load(ctx context.Context, db *store.DB, view string, limit int, now time.Ti
 		if err != nil {
 			return Data{}, err
 		}
-		graphRows, err := queryTodayHourlyGraph(ctx, db, start)
+		graphRows, err := queryTodayTimeBlockGraph(ctx, db, start)
 		if err != nil {
 			return Data{}, err
 		}
@@ -123,6 +124,17 @@ func LoadSessionsForDay(ctx context.Context, db *store.DB, day string, limit int
 		return Data{}, err
 	}
 	data := Data{View: "sessions", Period: "day", PeriodStart: day, SelectedIndex: -1, Rows: rows}
+	data.Totals = sumRows(rows)
+	data.Totals.CacheHitRate = cacheHitRate(data.Totals)
+	return data, nil
+}
+
+func LoadSessionsForTimeRange(ctx context.Context, db *store.DB, start, end, label string, limit int) (Data, error) {
+	rows, err := queryGrouped(ctx, db, "session_id", "timestamp >= ? AND timestamp < ?", limitOrDefault(limit), start, end)
+	if err != nil {
+		return Data{}, err
+	}
+	data := Data{View: "sessions", Period: "time_block", PeriodStart: label, SelectedIndex: -1, Rows: rows}
 	data.Totals = sumRows(rows)
 	data.Totals.CacheHitRate = cacheHitRate(data.Totals)
 	return data, nil
@@ -293,33 +305,43 @@ func queryDailySummaryForWeek(ctx context.Context, db *store.DB, weekStart strin
 	return rows, sqlRows.Err()
 }
 
-func queryTodayHourlyGraph(ctx context.Context, db *store.DB, day string) ([]Row, error) {
-	query := `WITH RECURSIVE hours(hour) AS (
-		SELECT 0
-		UNION ALL
-		SELECT hour + 1 FROM hours WHERE hour < 23
+func queryTodayTimeBlockGraph(ctx context.Context, db *store.DB, day string) ([]Row, error) {
+	query := `WITH blocks(block, label, start_hour, end_hour) AS (
+		VALUES
+			(0, '00:00-08:00', 0, 8),
+			(1, '08:00-18:00', 8, 18),
+			(2, '18:00-00:00', 18, 24)
 	),
-	hourly AS (
-		SELECT CAST(strftime('%H', timestamp) AS INTEGER) AS hour,
+	block_totals AS (
+		SELECT CASE
+				WHEN CAST(strftime('%H', timestamp) AS INTEGER) < 8 THEN 0
+				WHEN CAST(strftime('%H', timestamp) AS INTEGER) < 18 THEN 1
+				ELSE 2
+			END AS block,
 			SUM(total_tokens) AS total_tokens
 		FROM token_events
 		WHERE timestamp >= ? AND timestamp < date(?, '+1 day')
-		GROUP BY hour
+		GROUP BY block
 	)
-	SELECT CASE WHEN hours.hour = 23 THEN '23:59' ELSE printf('%02d:00', hours.hour) END,
-		COALESCE(hourly.total_tokens, 0)
-	FROM hours
-	LEFT JOIN hourly ON hourly.hour = hours.hour
-	ORDER BY hours.hour`
-	sqlRows, err := db.Query(ctx, query, day, day)
+	SELECT blocks.label,
+		printf('%sT%02d:00:00Z', ?, blocks.start_hour),
+		CASE WHEN blocks.end_hour = 24
+			THEN printf('%sT00:00:00Z', date(?, '+1 day'))
+			ELSE printf('%sT%02d:00:00Z', ?, blocks.end_hour)
+		END,
+		COALESCE(block_totals.total_tokens, 0)
+	FROM blocks
+	LEFT JOIN block_totals ON block_totals.block = blocks.block
+	ORDER BY blocks.block`
+	sqlRows, err := db.Query(ctx, query, day, day, day, day, day)
 	if err != nil {
 		return nil, err
 	}
 	defer sqlRows.Close()
-	rows := make([]Row, 0, 24)
+	rows := make([]Row, 0, 3)
 	for sqlRows.Next() {
 		var row Row
-		if err := sqlRows.Scan(&row.Label, &row.Totals.TotalTokens); err != nil {
+		if err := sqlRows.Scan(&row.Label, &row.FirstSeen, &row.LastSeen, &row.Totals.TotalTokens); err != nil {
 			return nil, err
 		}
 		rows = append(rows, row)
@@ -828,11 +850,14 @@ func RenderWithWidth(data Data, view string, width int) string {
 		if len(graphRows) == 0 {
 			graphRows = data.Rows
 		}
-		writeGraph(&b, graphRows, view, width)
+		writeTokenBarGraph(&b, graphRows, "Time", width, data.SelectedIndex)
 		b.WriteString("\n")
 	}
 	if view == "sessions" && data.Period == "day" && data.PeriodStart != "" {
 		fmt.Fprintf(&b, "Day: %s\n\n", formatDateLabel(data.PeriodStart))
+	}
+	if view == "sessions" && data.Period == "time_block" && data.PeriodStart != "" {
+		fmt.Fprintf(&b, "Time block: %s\n\n", data.PeriodStart)
 	}
 	writeRows(&b, data.Rows, view, data.SelectedIndex, width)
 	return b.String()
@@ -859,8 +884,9 @@ func writeSummary(b *strings.Builder, data Data, width int) {
 	} else {
 		fmt.Fprintf(b, "Weekly credits: %s  Function calls: %s\n\n", formatCredits(credits), formatInt(calls))
 	}
-	writeCreditsGraph(b, data.Rows, width)
+	writeTokenBarGraph(b, reversedRows(data.Rows), summaryFirstColumn(data), width, -1)
 	b.WriteString("\n")
+	weeklyBudget := weeklyCreditBudget()
 	tableRows := [][]string{{summaryFirstColumn(data), "Budget", "Text Tokens", "Uncached", "Cache Read", "Cache Hit", "FCalls"}}
 	for i, row := range data.Rows {
 		label := row.Label
@@ -869,7 +895,7 @@ func writeSummary(b *strings.Builder, data Data, width int) {
 		}
 		tableRows = append(tableRows, []string{
 			label,
-			progressBar(row.Totals.Credits, weeklyCreditBudget, 20),
+			progressBar(row.Totals.Credits, weeklyBudget, 20),
 			formatInt(row.Totals.TotalTokens),
 			formatInt(row.Totals.UncachedInputTokens),
 			formatInt(row.Totals.CacheReadInputTokens),
@@ -1203,50 +1229,75 @@ func displayWidth(value string) int {
 	return lipgloss.Width(value)
 }
 
-func writeGraph(b *strings.Builder, rows []Row, view string, width int) {
-	values := make([]float64, 0, len(rows))
-	for _, row := range rows {
-		values = append(values, float64(row.Totals.TotalTokens))
-	}
-	if len(values) == 0 {
-		return
-	}
-	options := []asciigraph.Option{
-		asciigraph.Height(8),
-		asciigraph.YAxisValueFormatter(graphValueFormatter(view)),
-	}
-	if width > 0 {
-		options = append(options, asciigraph.Width(width))
-	}
-	b.WriteString(asciigraph.Plot(values, options...))
-	b.WriteString("\n")
-}
-
-func writeCreditsGraph(b *strings.Builder, rows []Row, width int) {
+func writeTokenBarGraph(b *strings.Builder, rows []Row, labelHeader string, width, selectedIndex int) {
 	if len(rows) == 0 {
 		return
 	}
-	values := make([]float64, 0, len(rows))
-	for i := len(rows) - 1; i >= 0; i-- {
-		values = append(values, rows[i].Totals.Credits)
+	labelWidth := displayWidth(labelHeader)
+	valueWidth := displayWidth("Tokens")
+	maxValue := float64(0)
+	for _, row := range rows {
+		labelWidth = maxInt(labelWidth, displayWidth(row.Label))
+		value := float64(row.Totals.TotalTokens)
+		maxValue = math.Max(maxValue, value)
+		valueWidth = maxInt(valueWidth, displayWidth(formatInt(row.Totals.TotalTokens)))
 	}
-	options := []asciigraph.Option{
-		asciigraph.Height(8),
-		asciigraph.YAxisValueFormatter(func(value float64) string {
-			return formatCredits(value)
-		}),
-	}
+	barWidth := 32
 	if width > 0 {
-		options = append(options, asciigraph.Width(width))
+		barWidth = width - labelWidth - valueWidth - 4
 	}
-	b.WriteString(asciigraph.Plot(values, options...))
+	if barWidth < 8 {
+		barWidth = 8
+	}
+
+	fmt.Fprintf(b, "%s | %s %s\n", padRight(labelHeader, labelWidth), padRight("Tokens", barWidth), padRight("Total", valueWidth))
+	for i, row := range rows {
+		value := float64(row.Totals.TotalTokens)
+		label := row.Label
+		if i == selectedIndex {
+			label = selectedRowMarker + label
+		}
+		fmt.Fprintf(
+			b,
+			"%s | %s %s\n",
+			padRight(label, labelWidth),
+			bar(value, maxValue, barWidth),
+			padRight(formatInt(row.Totals.TotalTokens), valueWidth),
+		)
+	}
 	b.WriteString("\n")
 }
 
-func graphValueFormatter(view string) func(float64) string {
-	return func(value float64) string {
-		return formatCompactFloat(value)
+func reversedRows(rows []Row) []Row {
+	reversed := make([]Row, 0, len(rows))
+	for i := len(rows) - 1; i >= 0; i-- {
+		reversed = append(reversed, rows[i])
 	}
+	return reversed
+}
+
+func bar(value, max float64, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if max <= 0 {
+		return strings.Repeat("░", width)
+	}
+	filled := int(math.Round((value / max) * float64(width)))
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > width {
+		filled = width
+	}
+	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func sumRows(rows []Row) Totals {
@@ -1257,7 +1308,22 @@ func sumRows(rows []Row) Totals {
 	return withDerived(totals)
 }
 
-const weeklyCreditBudget = 10_000
+const (
+	weeklyCreditBudgetEnv     = "AGENT_STATS_WEEKLY_CREDIT_BUDGET"
+	defaultWeeklyCreditBudget = 10_000
+)
+
+func weeklyCreditBudget() float64 {
+	value := strings.TrimSpace(os.Getenv(weeklyCreditBudgetEnv))
+	if value == "" {
+		return defaultWeeklyCreditBudget
+	}
+	budget, err := strconv.ParseFloat(value, 64)
+	if err != nil || budget <= 0 {
+		return defaultWeeklyCreditBudget
+	}
+	return budget
+}
 
 func progressBar(value, max float64, width int) string {
 	if width <= 0 {

@@ -49,12 +49,16 @@ type model struct {
 	selected      int
 	preview       int
 	summaryRow    int
+	todayBlock    int
 	row           int
 	payloadRow    int
 	session       string
 	interaction   string
 	summaryWeek   string
 	sessionsDay   string
+	sessionsStart string
+	sessionsEnd   string
+	sessionsLabel string
 	pendingDelete string
 }
 
@@ -131,6 +135,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = commandHelp()
 			return m, nil
 		case "enter":
+			if viewNames[m.active] == "today" && len(m.data.GraphRows) > 0 {
+				m.clampTodayBlock()
+				block := m.data.GraphRows[m.todayBlock]
+				m.sessionsStart = block.FirstSeen
+				m.sessionsEnd = block.LastSeen
+				m.sessionsLabel = block.Label
+				m.sessionsDay = ""
+				m.row = 0
+				if idx := viewIndex("sessions"); idx >= 0 {
+					m.active = idx
+				}
+				m.reload()
+				return m, nil
+			}
 			if viewNames[m.active] == "summary" && len(m.data.Rows) > 0 {
 				m.clampSummaryRow()
 				if m.summaryWeek == "" {
@@ -138,6 +156,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.summaryRow = 0
 				} else {
 					m.sessionsDay = m.data.Rows[m.summaryRow].PeriodStart
+					m.clearSessionsTimeBlock()
 					m.summaryWeek = ""
 					m.summaryRow = 0
 					m.row = 0
@@ -182,6 +201,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.reload()
 				return m, nil
 			}
+			if viewNames[m.active] == "sessions" && m.sessionsStart != "" {
+				m.clearSessionsTimeBlock()
+				m.reload()
+				return m, nil
+			}
 			if viewNames[m.active] == "payload" && m.interaction != "" {
 				m.interaction = ""
 				m.reload()
@@ -199,6 +223,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.ScrollLeft(8)
 			return m, nil
 		case "j", "down":
+			if viewNames[m.active] == "today" && len(m.data.GraphRows) > 0 {
+				m.todayBlock++
+				m.clampTodayBlock()
+				m.setViewportContent()
+				return m, nil
+			}
 			if viewNames[m.active] == "summary" && len(m.data.Rows) > 0 {
 				m.summaryRow++
 				m.clampSummaryRow()
@@ -220,7 +250,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "k", "up":
+			if viewNames[m.active] == "today" && len(m.data.GraphRows) > 0 {
+				if m.todayBlock == 0 {
+					m.viewport.LineUp(1)
+					return m, nil
+				}
+				m.todayBlock--
+				m.clampTodayBlock()
+				m.setViewportContent()
+				return m, nil
+			}
 			if viewNames[m.active] == "summary" && len(m.data.Rows) > 0 {
+				if m.summaryRow == 0 {
+					m.viewport.LineUp(1)
+					return m, nil
+				}
 				m.summaryRow--
 				m.clampSummaryRow()
 				m.setViewportContent()
@@ -246,6 +290,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.interaction = ""
 			m.summaryWeek = ""
 			m.sessionsDay = ""
+			m.clearSessionsTimeBlock()
 			m.reload()
 			return m, nil
 		case "shift+tab":
@@ -257,6 +302,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.interaction = ""
 			m.summaryWeek = ""
 			m.sessionsDay = ""
+			m.clearSessionsTimeBlock()
 			m.reload()
 			return m, nil
 		}
@@ -270,6 +316,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.interaction = ""
 					m.summaryWeek = ""
 					m.sessionsDay = ""
+					m.clearSessionsTimeBlock()
 					m.reload()
 				}
 			}
@@ -313,6 +360,7 @@ func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.summaryWeek = ""
 			}
 			m.sessionsDay = ""
+			m.clearSessionsTimeBlock()
 			m.err = ""
 			m.reload()
 		} else if value == "help" {
@@ -393,6 +441,8 @@ func (m *model) reload() {
 	)
 	if viewNames[m.active] == "summary" && m.summaryWeek != "" {
 		data, err = views.LoadSummaryWeek(m.ctx, m.db, m.summaryWeek)
+	} else if viewNames[m.active] == "sessions" && m.sessionsStart != "" {
+		data, err = views.LoadSessionsForTimeRange(m.ctx, m.db, m.sessionsStart, m.sessionsEnd, m.sessionsLabel, 20)
 	} else if viewNames[m.active] == "sessions" && m.sessionsDay != "" {
 		data, err = views.LoadSessionsForDay(m.ctx, m.db, m.sessionsDay, 20)
 	} else if viewNames[m.active] == "payload" && m.session != "" {
@@ -425,6 +475,10 @@ func (m *model) reload() {
 			m.summaryRow = 0
 		}
 		data.SelectedIndex = m.summaryRow
+	}
+	if viewNames[m.active] == "today" {
+		m.clampTodayBlockFor(data.GraphRows)
+		data.SelectedIndex = m.todayBlock
 	}
 	if m.inSessionPayload() && m.interaction == "" {
 		if m.payloadRow >= len(data.Rows) {
@@ -499,6 +553,9 @@ func (m model) renderContent() string {
 func (m model) renderPlainContent() string {
 	if viewNames[m.active] == "sessions" {
 		m.data.SelectedIndex = m.row
+	}
+	if viewNames[m.active] == "today" {
+		m.data.SelectedIndex = m.todayBlock
 	}
 	if viewNames[m.active] == "summary" {
 		m.data.SelectedIndex = m.summaryRow
@@ -579,6 +636,25 @@ func (m *model) clampSummaryRow() {
 	}
 }
 
+func (m *model) clampTodayBlock() {
+	m.clampTodayBlockFor(m.data.GraphRows)
+}
+
+func (m *model) clampTodayBlockFor(rows []views.Row) {
+	if m.todayBlock >= len(rows) {
+		m.todayBlock = len(rows) - 1
+	}
+	if m.todayBlock < 0 {
+		m.todayBlock = 0
+	}
+}
+
+func (m *model) clearSessionsTimeBlock() {
+	m.sessionsStart = ""
+	m.sessionsEnd = ""
+	m.sessionsLabel = ""
+}
+
 func (m *model) clampPayloadRow() {
 	if m.payloadRow >= len(m.data.Rows) {
 		m.payloadRow = len(m.data.Rows) - 1
@@ -636,6 +712,7 @@ func (m *model) deleteSession(sessionID string) {
 	m.session = ""
 	m.interaction = ""
 	m.sessionsDay = ""
+	m.clearSessionsTimeBlock()
 	m.reload()
 }
 
