@@ -2,9 +2,11 @@ package views
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,24 +31,31 @@ type Totals struct {
 }
 
 type Row struct {
-	Label         string `json:"label"`
-	PeriodStart   string `json:"period_start,omitempty"`
-	Directory     string `json:"directory,omitempty"`
-	Model         string `json:"model,omitempty"`
-	EventType     string `json:"event_type,omitempty"`
-	Phase         string `json:"phase,omitempty"`
-	FunctionCalls int64  `json:"function_calls,omitempty"`
-	SessionCount  int64  `json:"session_count,omitempty"`
-	Count         int64  `json:"count,omitempty"`
-	PayloadBytes  int64  `json:"payload_bytes,omitempty"`
-	AvgBytes      int64  `json:"avg_bytes,omitempty"`
-	MaxBytes      int64  `json:"max_bytes,omitempty"`
-	AvgDurationMS int64  `json:"avg_duration_ms,omitempty"`
-	MaxDurationMS int64  `json:"max_duration_ms,omitempty"`
-	AvgTTFTMS     int64  `json:"avg_time_to_first_token_ms,omitempty"`
-	FirstSeen     string `json:"first_seen,omitempty"`
-	LastSeen      string `json:"last_seen,omitempty"`
-	Totals        Totals `json:"totals"`
+	ID                  int64  `json:"id,omitempty"`
+	Label               string `json:"label"`
+	PeriodStart         string `json:"period_start,omitempty"`
+	Directory           string `json:"directory,omitempty"`
+	Model               string `json:"model,omitempty"`
+	EventType           string `json:"event_type,omitempty"`
+	Phase               string `json:"phase,omitempty"`
+	CallID              string `json:"call_id,omitempty"`
+	Arguments           string `json:"arguments,omitempty"`
+	FunctionCalls       int64  `json:"function_calls,omitempty"`
+	SessionCount        int64  `json:"session_count,omitempty"`
+	Count               int64  `json:"count,omitempty"`
+	PayloadBytes        int64  `json:"payload_bytes,omitempty"`
+	AvgBytes            int64  `json:"avg_bytes,omitempty"`
+	MaxBytes            int64  `json:"max_bytes,omitempty"`
+	ArgumentsBytes      int64  `json:"arguments_bytes,omitempty"`
+	ResponseOutputBytes int64  `json:"response_output_bytes,omitempty"`
+	AvgResponseBytes    int64  `json:"avg_response_bytes,omitempty"`
+	MaxResponseBytes    int64  `json:"max_response_bytes,omitempty"`
+	AvgDurationMS       int64  `json:"avg_duration_ms,omitempty"`
+	MaxDurationMS       int64  `json:"max_duration_ms,omitempty"`
+	AvgTTFTMS           int64  `json:"avg_time_to_first_token_ms,omitempty"`
+	FirstSeen           string `json:"first_seen,omitempty"`
+	LastSeen            string `json:"last_seen,omitempty"`
+	Totals              Totals `json:"totals"`
 }
 
 type Data struct {
@@ -57,6 +66,8 @@ type Data struct {
 	Interaction   string `json:"interaction,omitempty"`
 	SelectedIndex int    `json:"selected_index,omitempty"`
 	Summary       []Row  `json:"summary,omitempty"`
+	DetailFields  []Row  `json:"detail_fields,omitempty"`
+	Detail        string `json:"detail,omitempty"`
 	GraphRows     []Row  `json:"graph_rows,omitempty"`
 	Totals        Totals `json:"totals"`
 	Rows          []Row  `json:"rows"`
@@ -129,7 +140,7 @@ func LoadSessionsForDay(ctx context.Context, db *store.DB, day string, limit int
 }
 
 func LoadSessionPayload(ctx context.Context, db *store.DB, sessionID string, limit int) (Data, error) {
-	rows, err := querySessionInteractions(ctx, db, sessionID, limitOrDefault(limit))
+	rows, err := querySessionResponses(ctx, db, sessionID, limitOrDefault(limit))
 	if err != nil {
 		return Data{}, err
 	}
@@ -138,14 +149,18 @@ func LoadSessionPayload(ctx context.Context, db *store.DB, sessionID string, lim
 		return Data{}, err
 	}
 	data := Data{View: "payload", Session: sessionID, SelectedIndex: -1, Summary: summary, Rows: rows}
-	for _, row := range rows {
-		data.Totals = addTotals(data.Totals, row.Totals)
-	}
-	data.Totals.CacheHitRate = cacheHitRate(data.Totals)
 	return data, nil
 }
 
 func LoadPayloadInteraction(ctx context.Context, db *store.DB, sessionID, interaction string) (Data, error) {
+	payloadID, err := strconv.ParseInt(interaction, 10, 64)
+	if err == nil && payloadID > 0 {
+		detail, fields, err := queryPayloadDetail(ctx, db, sessionID, payloadID)
+		if err != nil {
+			return Data{}, err
+		}
+		return Data{View: "payload", Session: sessionID, Interaction: interaction, SelectedIndex: -1, Detail: detail, DetailFields: fields}, nil
+	}
 	summary, err := queryInteractionSummary(ctx, db, sessionID, interaction)
 	if err != nil {
 		return Data{}, err
@@ -367,12 +382,6 @@ func querySessionPayloadSummary(ctx context.Context, db *store.DB, sessionID str
 		row.AvgDurationMS = diffMillis(row.FirstSeen, row.LastSeen)
 		rows = append(rows, row)
 	}
-	if row, err := singlePayloadMetric(ctx, db, sessionID, "prompt-final", `SELECT 'prompt to final answer', '', 1, 0, 0, 0, 0, 0, 0, COALESCE(MIN(CASE WHEN top_level_type = 'event_msg' THEN timestamp END), ''), COALESCE(MAX(CASE WHEN top_level_type = 'response_item' AND payload_type = 'message' THEN timestamp END), '') FROM payload_events WHERE session_id = ?`); err != nil {
-		return nil, err
-	} else {
-		row.AvgDurationMS = diffMillis(row.FirstSeen, row.LastSeen)
-		rows = append(rows, row)
-	}
 	if row, err := singlePayloadMetric(ctx, db, sessionID, "response_item timing", `SELECT 'response_item timing', '', COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(CAST(AVG(payload_bytes) AS INTEGER), 0), COALESCE(MAX(payload_bytes), 0), COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0), COALESCE(MAX(duration_ms), 0), COALESCE(CAST(AVG(time_to_first_token_ms) AS INTEGER), 0), COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '') FROM payload_events WHERE session_id = ? AND top_level_type = 'response_item'`); err != nil {
 		return nil, err
 	} else {
@@ -422,7 +431,10 @@ func queryTopCommands(ctx context.Context, db *store.DB, sessionID, startAfter, 
 		where += " AND timestamp > ?"
 		args = append(args, startAfter)
 	}
-	query := `SELECT 'top command', COALESCE(NULLIF(normalized_command, ''), command_name), COUNT(*), 0, 0, 0, 0, 0, 0, COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '')
+	query := `SELECT 'command', COALESCE(NULLIF(normalized_command, ''), command_name), COUNT(*),
+		COALESCE(SUM(arguments_bytes), 0), COALESCE(CAST(AVG(arguments_bytes) AS INTEGER), 0), COALESCE(MAX(arguments_bytes), 0),
+		COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0), COALESCE(MAX(duration_ms), 0), 0,
+		COALESCE(MIN(timestamp), ''), COALESCE(MAX(timestamp), '')
 		FROM payload_events
 		WHERE ` + where + `
 		GROUP BY COALESCE(NULLIF(normalized_command, ''), command_name)
@@ -532,6 +544,178 @@ func previousInteraction(ctx context.Context, db *store.DB, sessionID, interacti
 	return previous, rows.Err()
 }
 
+type payloadDetail struct {
+	ID          int64
+	Timestamp   string
+	TopLevel    string
+	PayloadType string
+	Phase       string
+	Role        string
+	Command     string
+	CallID      string
+	PayloadJSON string
+	RawJSON     string
+}
+
+func queryPayloadDetail(ctx context.Context, db *store.DB, sessionID string, payloadID int64) (string, []Row, error) {
+	detail, err := payloadDetailRow(ctx, db, `id = ? AND session_id = ?`, payloadID, sessionID)
+	if err != nil {
+		return "", nil, err
+	}
+	if detail.PayloadType == "function_call" && detail.CallID != "" {
+		outputDetail, err := payloadDetailRow(ctx, db, `session_id = ? AND call_id = ? AND payload_type = 'function_call_output'`, sessionID, detail.CallID)
+		if err == nil && (outputDetail.PayloadJSON != "" || outputDetail.RawJSON != "") {
+			return formatPayloadDetail(outputDetail.PayloadJSON, outputDetail.RawJSON), payloadDetailFields(outputDetail), nil
+		}
+	}
+	return formatPayloadDetail(detail.PayloadJSON, detail.RawJSON), payloadDetailFields(detail), nil
+}
+
+func payloadDetailRow(ctx context.Context, db *store.DB, where string, args ...any) (payloadDetail, error) {
+	query := `SELECT id, timestamp, top_level_type, payload_type, phase, role,
+			COALESCE(NULLIF(normalized_command, ''), NULLIF(command_name, ''), ''),
+			call_id, payload_json, raw_json
+		FROM payload_events
+		WHERE ` + where + `
+		ORDER BY timestamp ASC, id ASC
+		LIMIT 1`
+	rows, err := db.Query(ctx, query, args...)
+	if err != nil {
+		return payloadDetail{}, err
+	}
+	defer rows.Close()
+	var detail payloadDetail
+	if rows.Next() {
+		if err := rows.Scan(
+			&detail.ID,
+			&detail.Timestamp,
+			&detail.TopLevel,
+			&detail.PayloadType,
+			&detail.Phase,
+			&detail.Role,
+			&detail.Command,
+			&detail.CallID,
+			&detail.PayloadJSON,
+			&detail.RawJSON,
+		); err != nil {
+			return payloadDetail{}, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return payloadDetail{}, err
+	}
+	return detail, nil
+}
+
+func payloadDetailFields(detail payloadDetail) []Row {
+	values := []struct {
+		key   string
+		value string
+	}{
+		{key: "type", value: detail.PayloadType},
+		{key: "metadata", value: detail.TopLevel},
+		{key: "phase", value: detail.Phase},
+		{key: "role", value: detail.Role},
+		{key: "command", value: detail.Command},
+		{key: "call_id", value: detail.CallID},
+		{key: "timestamp", value: compactTime(detail.Timestamp)},
+	}
+	fields := make([]Row, 0, len(values))
+	for _, value := range values {
+		if value.value == "" {
+			continue
+		}
+		fields = append(fields, Row{Label: value.key, Phase: value.value})
+	}
+	return fields
+}
+
+func formatPayloadDetail(payloadJSON, rawJSON string) string {
+	content := payloadJSON
+	if content == "" {
+		content = rawJSON
+	}
+	if content == "" {
+		return "No payload found."
+	}
+	var value any
+	if err := json.Unmarshal([]byte(content), &value); err == nil {
+		if text := renderedPayloadText(value); text != "" {
+			return normalizeEscapedText(text)
+		}
+		if rendered, err := json.MarshalIndent(value, "", "  "); err == nil {
+			content = string(rendered)
+		}
+	}
+	return normalizeEscapedText(content)
+}
+
+func normalizeEscapedText(content string) string {
+	content = strings.ReplaceAll(content, `\n`, "\n")
+	content = strings.ReplaceAll(content, `\t`, "\t")
+	return content
+}
+
+func renderedPayloadText(value any) string {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if payload, ok := object["payload"]; ok {
+		if text := renderedPayloadText(payload); text != "" {
+			return text
+		}
+	}
+	if text := contentText(object["content"]); text != "" {
+		return text
+	}
+	for _, key := range []string{"output", "text", "arguments"} {
+		text, ok := object[key].(string)
+		if !ok || text == "" {
+			continue
+		}
+		if key == "arguments" {
+			return formatArgumentText(text)
+		}
+		return text
+	}
+	return ""
+}
+
+func contentText(value any) string {
+	switch content := value.(type) {
+	case string:
+		return content
+	case []any:
+		parts := make([]string, 0, len(content))
+		for _, item := range content {
+			object, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			text, ok := object["text"].(string)
+			if ok && text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n\n")
+	default:
+		return ""
+	}
+}
+
+func formatArgumentText(value string) string {
+	var decoded any
+	if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+		return value
+	}
+	rendered, err := json.MarshalIndent(decoded, "", "  ")
+	if err != nil {
+		return value
+	}
+	return string(rendered)
+}
+
 func singlePayloadMetricArgs(ctx context.Context, db *store.DB, label, query string, args ...any) (Row, error) {
 	sqlRows, err := db.Query(ctx, query, args...)
 	if err != nil {
@@ -562,13 +746,30 @@ func singlePayloadMetric(ctx context.Context, db *store.DB, sessionID, label, qu
 	return row, sqlRows.Err()
 }
 
-func querySessionInteractions(ctx context.Context, db *store.DB, sessionID string, limit int) ([]Row, error) {
-	query := `SELECT timestamp,
-		input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-		payload_bytes, duration_ms, time_to_first_token_ms
+func querySessionResponses(ctx context.Context, db *store.DB, sessionID string, limit int) ([]Row, error) {
+	query := `SELECT id,
+		CASE WHEN payload_type = 'message' AND role = 'assistant' THEN 'llm_response' ELSE payload_type END,
+		COALESCE(NULLIF(normalized_command, ''), NULLIF(command_name, ''), ''),
+		COALESCE(arguments, ''),
+		COALESCE(call_id, ''),
+		1,
+		payload_bytes,
+		payload_bytes,
+		payload_bytes,
+		arguments_bytes,
+		response_output_bytes,
+		response_output_bytes,
+		response_output_bytes,
+		duration_ms,
+		duration_ms,
+		time_to_first_token_ms,
+		timestamp,
+		timestamp
 		FROM payload_events
-		WHERE session_id = ? AND payload_type = 'token_count'
-		ORDER BY timestamp DESC`
+		WHERE session_id = ?
+			AND top_level_type = 'response_item'
+			AND payload_type IN ('function_call', 'function_call_output', 'message')
+		ORDER BY timestamp DESC, id DESC`
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -580,10 +781,28 @@ func querySessionInteractions(ctx context.Context, db *store.DB, sessionID strin
 	var rows []Row
 	for sqlRows.Next() {
 		var row Row
-		if err := sqlRows.Scan(&row.Label, &row.Totals.InputTokens, &row.Totals.CachedInputTokens, &row.Totals.OutputTokens, &row.Totals.ReasoningOutputTokens, &row.Totals.TotalTokens, &row.PayloadBytes, &row.AvgDurationMS, &row.AvgTTFTMS); err != nil {
+		if err := sqlRows.Scan(
+			&row.ID,
+			&row.Label,
+			&row.Phase,
+			&row.Arguments,
+			&row.CallID,
+			&row.Count,
+			&row.PayloadBytes,
+			&row.AvgBytes,
+			&row.MaxBytes,
+			&row.ArgumentsBytes,
+			&row.ResponseOutputBytes,
+			&row.AvgResponseBytes,
+			&row.MaxResponseBytes,
+			&row.AvgDurationMS,
+			&row.MaxDurationMS,
+			&row.AvgTTFTMS,
+			&row.FirstSeen,
+			&row.LastSeen,
+		); err != nil {
 			return nil, err
 		}
-		row.Totals = withDerived(row.Totals)
 		rows = append(rows, row)
 	}
 	return rows, sqlRows.Err()
@@ -798,10 +1017,23 @@ func RenderWithWidth(data Data, view string, width int) string {
 	if view == "payload" {
 		writePayloadSummary(&b, data, width)
 		if data.Interaction != "" {
+			if data.Detail != "" {
+				writePayloadDetailFields(&b, data.DetailFields, width)
+				b.WriteString("\n")
+				b.WriteString("\nPayload\n")
+				b.WriteString(data.Detail)
+				if !strings.HasSuffix(data.Detail, "\n") {
+					b.WriteString("\n")
+				}
+			}
 			return b.String()
 		}
 		if len(data.Rows) == 0 {
-			b.WriteString("\nNo payload events found.\n")
+			if data.Session != "" {
+				b.WriteString("\nNo response items found.\n")
+			} else {
+				b.WriteString("\nNo payload events found.\n")
+			}
 			return b.String()
 		}
 		b.WriteString("\n")
@@ -907,6 +1139,36 @@ func writeCommandRows(b *strings.Builder, rows []Row, width int) {
 	}
 }
 
+func writePayloadDetailFields(b *strings.Builder, fields []Row, width int) {
+	if len(fields) == 0 {
+		return
+	}
+	if width <= 0 {
+		width = 96
+	}
+	columnCount := 3
+	gap := 2
+	columnWidth := (width - (gap * (columnCount - 1))) / columnCount
+	if columnWidth < 20 {
+		columnWidth = 20
+	}
+	for index := 0; index < len(fields); index += columnCount {
+		for column := 0; column < columnCount; column++ {
+			fieldIndex := index + column
+			cell := ""
+			if fieldIndex < len(fields) {
+				field := fields[fieldIndex]
+				cell = truncate(field.Label+": "+field.Phase, columnWidth)
+			}
+			b.WriteString(padRight(cell, columnWidth))
+			if column < columnCount-1 {
+				b.WriteString(strings.Repeat(" ", gap))
+			}
+		}
+		b.WriteString("\n")
+	}
+}
+
 func writePayloadSummary(b *strings.Builder, data Data, width int) {
 	if data.Session == "" {
 		var count, bytes int64
@@ -914,34 +1176,138 @@ func writePayloadSummary(b *strings.Builder, data Data, width int) {
 			count += row.Count
 			bytes += row.PayloadBytes
 		}
-		fmt.Fprintf(b, "Payload groups: %d  Events: %s  Payload bytes: %s\n", len(data.Rows), formatInt(count), formatInt(bytes))
+		fmt.Fprintf(b, "Payload groups: %d  Events: %s  Payload bytes: %s\n", len(data.Rows), formatInt(count), formatBytes(bytes))
 		return
 	}
 	fmt.Fprintf(b, "Session: %s\n", data.Session)
 	if data.Interaction != "" {
-		fmt.Fprintf(b, "Interaction: %s\n", compactTime(data.Interaction))
+		fmt.Fprintf(b, "Payload: %s\n", compactTime(data.Interaction))
 	}
 	if len(data.Summary) == 0 {
 		return
 	}
-	tableRows := [][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes", "Avg Dur", "Max Dur", "Avg TTFT"}}
-	for _, row := range data.Summary {
-		tableRows = append(tableRows, []string{
+	writeSessionPayloadSummary(b, data.Summary, width)
+}
+
+func writeSessionPayloadSummary(b *strings.Builder, rows []Row, width int) {
+	duration, metadata, commands := splitSessionSummaryRows(rows)
+	if width <= 0 {
+		width = tableWidth(columnsFor([][]string{{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes"}}))
+	}
+	gap := 2
+	leftWidth := width * 3 / 12
+	if leftWidth < 24 {
+		leftWidth = 24
+	}
+	rightWidth := width - leftWidth - gap
+	if rightWidth < 40 {
+		rightWidth = 40
+	}
+
+	left := renderDurationPanel(duration, leftWidth)
+	right := renderMetadataTable(metadata, rightWidth, false)
+	b.WriteString(joinColumns(left, right, gap))
+	b.WriteString("\n")
+
+	if len(commands) > 0 {
+		b.WriteString("Function calls\n")
+		b.WriteString(renderMetadataTable(commands, width, true))
+	}
+}
+
+func splitSessionSummaryRows(rows []Row) (Row, []Row, []Row) {
+	var duration Row
+	var metadata []Row
+	var commands []Row
+	for _, row := range rows {
+		switch row.Label {
+		case "session duration":
+			duration = row
+		case "command":
+			commands = append(commands, row)
+		default:
+			metadata = append(metadata, row)
+		}
+	}
+	return duration, metadata, commands
+}
+
+func renderDurationPanel(row Row, width int) string {
+	tableRows := [][]string{{"Metric", "Avg Duration"}}
+	tableRows = append(tableRows, []string{"session_duration", formatDuration(row.AvgDurationMS)})
+	return renderTable(tableRows, width)
+}
+
+func renderMetadataTable(rows []Row, width int, includeTiming bool) string {
+	headers := []string{"Metric", "Phase", "Count", "Payload Total", "Avg Bytes", "Max Bytes"}
+	if includeTiming {
+		headers = append(headers, "Avg Dur", "Max Dur", "Avg TTFT")
+	}
+	tableRows := [][]string{headers}
+	for _, row := range rows {
+		values := []string{
 			truncate(row.Label, 26),
 			truncate(row.Phase, 12),
 			formatInt(row.Count),
-			formatInt(row.PayloadBytes),
-			formatInt(row.AvgBytes),
-			formatInt(row.MaxBytes),
-			formatDuration(row.AvgDurationMS),
-			formatDuration(row.MaxDurationMS),
-			formatDuration(row.AvgTTFTMS),
-		})
+			formatBytes(row.PayloadBytes),
+			formatBytes(row.AvgBytes),
+			formatBytes(row.MaxBytes),
+		}
+		if includeTiming {
+			values = append(values,
+				formatDuration(row.AvgDurationMS),
+				formatDuration(row.MaxDurationMS),
+				formatDuration(row.AvgTTFTMS),
+			)
+		}
+		tableRows = append(tableRows, values)
 	}
+	return renderTable(tableRows, width)
+}
+
+func renderTable(tableRows [][]string, width int) string {
+	var b strings.Builder
 	columns := columnsForWidth(tableRows, width)
 	for _, row := range tableRows {
-		writeTableLine(b, columns, row)
+		writeTableLine(&b, columns, row)
 	}
+	return b.String()
+}
+
+func joinColumns(left, right string, gap int) string {
+	leftLines := strings.Split(strings.TrimRight(left, "\n"), "\n")
+	rightLines := strings.Split(strings.TrimRight(right, "\n"), "\n")
+	leftWidth := maxLineWidth(leftLines)
+	lineCount := len(leftLines)
+	if len(rightLines) > lineCount {
+		lineCount = len(rightLines)
+	}
+	var b strings.Builder
+	for i := 0; i < lineCount; i++ {
+		leftLine := ""
+		if i < len(leftLines) {
+			leftLine = leftLines[i]
+		}
+		rightLine := ""
+		if i < len(rightLines) {
+			rightLine = rightLines[i]
+		}
+		b.WriteString(padRight(leftLine, leftWidth))
+		b.WriteString(strings.Repeat(" ", gap))
+		b.WriteString(rightLine)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func maxLineWidth(lines []string) int {
+	var width int
+	for _, line := range lines {
+		if lineWidth := displayWidth(line); lineWidth > width {
+			width = lineWidth
+		}
+	}
+	return width
 }
 
 func writePayloadRows(b *strings.Builder, rows []Row, width int) {
@@ -951,9 +1317,9 @@ func writePayloadRows(b *strings.Builder, rows []Row, width int) {
 			truncate(row.Label, 30),
 			truncate(row.Phase, 12),
 			formatInt(row.Count),
-			formatInt(row.PayloadBytes),
-			formatInt(row.AvgBytes),
-			formatInt(row.MaxBytes),
+			formatBytes(row.PayloadBytes),
+			formatBytes(row.AvgBytes),
+			formatBytes(row.MaxBytes),
 			formatDuration(row.AvgDurationMS),
 			formatDuration(row.MaxDurationMS),
 			formatDuration(row.AvgTTFTMS),
@@ -966,23 +1332,23 @@ func writePayloadRows(b *strings.Builder, rows []Row, width int) {
 }
 
 func writePayloadSessionRows(b *strings.Builder, rows []Row, selectedIndex int, width int) {
-	tableRows := [][]string{{"Interaction", "Total", "Uncached", "Cache Read", "Output", "Reasoning", "Payload Bytes", "Dur", "TTFT", "Hit Rate"}}
+	tableRows := [][]string{{"Type", "Command", "Arguments", "Count", "Output Bytes", "Avg Output", "Max Output", "Avg Dur", "Max Dur", "Avg TTFT"}}
 	for i, row := range rows {
-		label := compactTime(row.Label)
+		label := row.Label
 		if i == selectedIndex {
 			label = selectedRowMarker + label
 		}
 		tableRows = append(tableRows, []string{
-			label,
-			formatInt(row.Totals.TotalTokens),
-			formatInt(row.Totals.UncachedInputTokens),
-			formatInt(row.Totals.CacheReadInputTokens),
-			formatInt(row.Totals.OutputTokens),
-			formatInt(row.Totals.ReasoningOutputTokens),
-			formatInt(row.PayloadBytes),
+			truncate(label, 18),
+			truncate(row.Phase, 18),
+			truncate(row.Arguments, 44),
+			formatInt(row.Count),
+			formatBytes(row.ResponseOutputBytes),
+			formatBytes(row.AvgResponseBytes),
+			formatBytes(row.MaxResponseBytes),
 			formatDuration(row.AvgDurationMS),
+			formatDuration(row.MaxDurationMS),
 			formatDuration(row.AvgTTFTMS),
-			fmt.Sprintf("%.1f%%", row.Totals.CacheHitRate*100),
 		})
 	}
 	columns := columnsForWidth(tableRows, width)
@@ -1122,6 +1488,10 @@ func tableColumnFor(header string) tableColumn {
 	switch header {
 	case "Command":
 		return tableColumn{width: 28, align: alignLeft}
+	case "Type":
+		return tableColumn{width: 18, align: alignLeft}
+	case "Arguments":
+		return tableColumn{width: 44, align: alignLeft}
 	case "Payload":
 		return tableColumn{width: 30, align: alignLeft}
 	case "Metric":
@@ -1148,11 +1518,11 @@ func tableColumnFor(header string) tableColumn {
 		return tableColumn{width: 10, align: alignCenter}
 	case "Budget":
 		return tableColumn{width: 32, align: alignCenter}
-	case "Payload Bytes":
+	case "Output Bytes", "Payload Bytes":
 		return tableColumn{width: 13, align: alignCenter}
-	case "Payload Total", "Avg Bytes", "Max Bytes":
+	case "Payload Total", "Avg Bytes", "Max Bytes", "Avg Output", "Max Output":
 		return tableColumn{width: 10, align: alignCenter}
-	case "Avg Dur", "Max Dur", "Avg TTFT", "Dur", "TTFT":
+	case "Avg Duration", "Avg Dur", "Max Dur", "Avg TTFT", "Dur", "TTFT":
 		return tableColumn{width: 9, align: alignCenter}
 	case "Hit Rate":
 		return tableColumn{width: 10, align: alignCenter}
@@ -1339,6 +1709,27 @@ func formatCredits(n float64) string {
 		return trimCompactFloat(n)
 	}
 	return formatCompactFloat(n)
+}
+
+func formatBytes(n int64) string {
+	if n < 0 {
+		return "-" + formatBytes(-n)
+	}
+	units := []struct {
+		value  float64
+		suffix string
+	}{
+		{value: 1024 * 1024 * 1024, suffix: "gb"},
+		{value: 1024 * 1024, suffix: "mb"},
+		{value: 1024, suffix: "kb"},
+	}
+	value := float64(n)
+	for _, unit := range units {
+		if value >= unit.value {
+			return trimCompactFloat(value/unit.value) + unit.suffix
+		}
+	}
+	return fmt.Sprintf("%db", n)
 }
 
 func formatCompactFloat(n float64) string {
